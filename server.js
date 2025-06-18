@@ -31,6 +31,10 @@ const User = mongoose.model('User', new mongoose.Schema({
 }));
 
 // Базовые маршруты API
+app.get('/', (req, res) => {
+  res.redirect('/api/health');
+});
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date() });
 });
