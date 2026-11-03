@@ -1,0 +1,82 @@
+import request from 'supertest';
+import app from '../src/testApp';
+import { createGame, getState } from './helpers/api';
+
+/**
+ * Тесты правил non_unicorn:
+ * 1) Штрафные животные (blocks_unicorn_effects=true) не попадают в цели для эффектов с filters.card_group='unicorn'.
+ * 2) Карты с counts_for_win=false и карты с blocks_unicorn_effects=true не учитываются для победы.
+ */
+
+describe('non_unicorn rules', () => {
+  test('redirect targets: non_unicorn with blocks_unicorn_effects excluded from unicorn group', async () => {
+    // Карты
+    const cards: Record<string, any> = {
+      U1: { id: 'U1', type: 'basic_unicorn', name: 'Basic Unicorn', effects: [] },
+      N1: { id: 'N1', type: 'non_unicorn', name: 'Cat (Penalty)', blocks_unicorn_effects: true, effects: [] },
+      MD: {
+        id: 'MD', type: 'magic', name: 'Destroy Unicorn', effects: [
+          {
+            trigger: 'on_play',
+            actions: [{ kind: 'destroy', targets: { scope: 'opponent', zone: 'stable', quantity: { value: 1 }, filters: { card_group: 'unicorn' } } }]
+          }
+        ]
+      },
+    };
+
+    const state = {
+      players: [
+        { id: 'P1', deck: [], hand: ['MD'], discard: [], stable: [], nursery: [], field: [], action_points: 1 },
+        { id: 'P2', deck: [], hand: [], discard: [], stable: ['U1','N1'], nursery: [], field: [], action_points: 1 },
+      ],
+      turn: { currentPlayerId: 'P1', phase: 'action', has_drawn: false },
+      cards,
+      deck: [],
+      discard: [],
+    } as any;
+
+    const gameId = await createGame(state);
+
+    // Запрос списка целей для Destroy (unicorn)
+    const res = await request(app)
+      .get(`/api/game/${gameId}/targetOptions`)
+      .query({ cardId: 'MD', kind: 'destroy' })
+      .send();
+
+    expect(res.status).toBe(200);
+    const targets: string[] = res.body?.targets || [];
+    // Должен быть U1, но не N1
+    expect(targets).toContain('U1');
+    expect(targets).not.toContain('N1');
+  });
+
+  test('win condition: counts_for_win=false and non_unicorn are excluded', async () => {
+    const cards: Record<string, any> = {
+      Ucan: { id: 'Ucan', type: 'basic_unicorn', name: 'Cant Win', counts_for_win: false, effects: [] },
+      Uok: { id: 'Uok', type: 'basic_unicorn', name: 'Can Win', effects: [] },
+      Pen: { id: 'Pen', type: 'non_unicorn', name: 'Penalty', blocks_unicorn_effects: true, effects: [] },
+    };
+
+    const state = {
+      players: [
+        { id: 'P1', deck: [], hand: [], discard: [], stable: ['Ucan','Pen'], nursery: [], field: [], action_points: 1 },
+        { id: 'P2', deck: [], hand: [], discard: [], stable: ['Uok'], nursery: [], field: [], action_points: 1 },
+      ],
+      turn: { currentPlayerId: 'P1', phase: 'end_turn', has_drawn: false },
+      cards,
+      deck: [], // пустая колода, чтобы сработала проверка победы на endTurn
+      discard: [],
+    } as any;
+
+    const gameId = await createGame(state);
+
+    // Вызовем endTurn, который внутри делает checkWin
+    const endRes = await request(app).post(`/api/game/${gameId}/endTurn`).send();
+    expect([200,400]).toContain(endRes.status); // на случай валидаций — но ожидаем 200
+
+    const st = await getState(gameId);
+    // Победитель должен быть P2, так как у него 1 валидный единорог,
+    // а у P1 — единорог не считается (counts_for_win=false) + штрафная карта.
+    expect(st?.winnerId || (st as any).turn?.winnerId).toBe('P2');
+  });
+});

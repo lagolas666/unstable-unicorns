@@ -1,0 +1,115 @@
+import request from 'supertest';
+import app from '../src/testApp';
+import { createGame, getState, turnStart, turnStartChoose, play } from './helpers/api';
+import { geminiUnicorn, simpleUpgrade } from './helpers/cards';
+
+function skipPlayDowngrade(id: string) {
+  return { id, type: 'downgrade', name: 'Skip Play', skip_phases: ['play'], effects: [] } as any;
+}
+
+describe('Gemini Unicorn - on_turn_start extra action', () => {
+  test('use: discard 1 -> gains +1 action and can play two cards', async () => {
+    const p1 = { id: 'A' }, p2 = { id: 'B' };
+    const gState = {
+      players: [
+        { id: 'A', hand: ['h1','h2','h3'], stable: ['gem'], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+        { id: 'B', hand: [], stable: [], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+      ],
+      turn: { currentPlayerId: 'A', phase: 'begin_turn', has_drawn: false },
+      cards: {
+        gem: geminiUnicorn('gem'),
+        h1: simpleUpgrade('h1'),
+        h2: simpleUpgrade('h2'),
+        h3: simpleUpgrade('h3'),
+        d1: simpleUpgrade('d1'),
+        d2: simpleUpgrade('d2'),
+      },
+      deck: ['d1', 'd2'],
+      discard: [],
+    } as any;
+
+    const gameId = await createGame(gState);
+
+    // Trigger start of turn effects -> expect prompt
+    let res = await turnStart(gameId);
+    expect(res.status).toBe(200);
+    expect(res.body.pending?.kind).toBe('prompt');
+
+    // Choose to use, discard card h1
+    res = await turnStartChoose(gameId, { choice: 'use', targets: ['h1'] });
+    expect(res.status).toBe(200);
+    let state = await getState(gameId);
+    const p = state.players.find((pp: any) => pp.id === 'A');
+    expect(p.hand).toEqual(['h2','h3']);
+    expect(p.discard).toEqual(['h1']);
+    expect(p.action_points).toBe(2); // gained +1
+
+    // Move to action phase via official draw (draws 1, but deck is empty) -> phase becomes action
+    res = await request(app).post(`/api/game/${gameId}/draw`).send({});
+    expect(res.status).toBe(200);
+    state = res.body;
+    expect(state.turn.phase).toBe('action');
+
+    // Play two cards spending 2 AP
+    res = await play(gameId, 'h2');
+    expect(res.status).toBe(200);
+    state = res.body;
+    let a = state.players.find((pp: any) => pp.id === 'A');
+    expect(a.action_points).toBe(1);
+
+    res = await play(gameId, 'h3');
+    expect(res.status).toBe(200);
+    state = res.body;
+    a = state.players.find((pp: any) => pp.id === 'A');
+    expect(a.action_points).toBe(0);
+
+    // Third play must fail
+    res = await play(gameId, 'h1');
+    expect(res.status).toBe(400);
+    expect(res.body?.message).toMatch(/No action points/);
+  });
+
+  test('skip: choose skip -> stays at 1 action', async () => {
+    const gState = {
+      players: [
+        { id: 'A', hand: ['h1'], stable: ['gem'], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+        { id: 'B', hand: [], stable: [], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+      ],
+      turn: { currentPlayerId: 'A', phase: 'begin_turn', has_drawn: false },
+      cards: { gem: geminiUnicorn('gem'), h1: simpleUpgrade('h1') },
+      // D1b: непустая колода — иначе партия сразу окончена фоллбеком (колода И сброс пусты)
+      deck: ['z1', 'z2'],
+      discard: [],
+    } as any;
+    const gameId = await createGame(gState);
+    let res = await turnStart(gameId);
+    expect(res.status).toBe(200);
+    expect(res.body.pending?.kind).toBe('prompt');
+    res = await turnStartChoose(gameId, { choice: 'skip' });
+    expect(res.status).toBe(200);
+    const state = await getState(gameId);
+    const p = state.players.find((pp: any) => pp.id === 'A');
+    expect(p.action_points).toBe(1);
+  });
+
+  test('blocked by skip phase: play is skipped -> effect does not trigger (no prompt)', async () => {
+    const gState = {
+      players: [
+        { id: 'A', hand: ['h1'], stable: ['gem','blk'], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+        { id: 'B', hand: [], stable: [], discard: [], deck: [], nursery: [], field: [], action_points: 1 },
+      ],
+      turn: { currentPlayerId: 'A', phase: 'begin_turn', has_drawn: false },
+      cards: { gem: geminiUnicorn('gem'), h1: simpleUpgrade('h1'), blk: skipPlayDowngrade('blk') },
+      // D1b: непустая колода — иначе партия сразу окончена фоллбеком (колода И сброс пусты)
+      deck: ['z1', 'z2'],
+      discard: [],
+    } as any;
+    const gameId = await createGame(gState);
+    const res = await turnStart(gameId);
+    expect(res.status).toBe(200);
+    expect(res.body.pending).toBeFalsy();
+    const state = await getState(gameId);
+    const p = state.players.find((pp: any) => pp.id === 'A');
+    expect(p.action_points).toBe(1);
+  });
+});
