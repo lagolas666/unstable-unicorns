@@ -1,0 +1,66 @@
+import fs from 'fs';
+import path from 'path';
+import { Card } from '../../../shared/src/types';
+
+/**
+ * Каталог карт для стенда без Mongo.
+ *
+ * Зачем: без базы routes/game.ts подставлял тест-сид из 4 карт, в котором нет ни одного
+ * baby_unicorn и ни одной карты Neigh. Из-за этого нельзя проверить раздачу Nursery (TC-026)
+ * и открытие окна реакции на реальных данных.
+ *
+ * Фикстура собирается скриптом server/scripts/buildCatalogFixture.js из server/data/unicorns.json
+ * (сырьё импорта: 565 карт, из них 95 baby_unicorn). Кладётся в server/data/catalog.fixture.json.
+ *
+ * Базу этот модуль не заменяет: при живом соединении с Mongo карты берутся из Mongo,
+ * фикстура подключается только если Mongo пуст или недоступен.
+ */
+
+const RELATIVE_CANDIDATES = [
+  // ts-node / jest: __dirname = server/src/data
+  path.join(__dirname, '..', '..', 'data', 'catalog.fixture.json'),
+  // скомпилированный вариант и запуск из корня проекта
+  path.join(process.cwd(), 'data', 'catalog.fixture.json'),
+  path.join(process.cwd(), 'server', 'data', 'catalog.fixture.json'),
+  path.join(__dirname, '..', '..', '..', 'data', 'catalog.fixture.json'),
+];
+
+let cached: Card[] | null = null;
+let tried = false;
+
+/** Путь к найденной фикстуре или null. */
+export function catalogFixturePath(): string | null {
+  for (const p of RELATIVE_CANDIDATES) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {
+      // недоступный путь — пробуем следующий
+    }
+  }
+  return null;
+}
+
+/**
+ * Карты из фикстуры каталога. Пустой массив, если файла нет или он битый:
+ * вызывающая сторона в этом случае остаётся на тест-сиде, поведение прежнее.
+ */
+export function loadCatalogFixture(): Card[] {
+  if (tried) return cached || [];
+  tried = true;
+  const p = catalogFixturePath();
+  if (!p) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!Array.isArray(parsed)) return [];
+    cached = parsed.filter((c: any) => c && c.id && c.name && c.type) as Card[];
+    return cached;
+  } catch (_) {
+    return [];
+  }
+}
+
+/** Только для тестов: сбросить кеш между прогонами. */
+export function resetCatalogFixtureCache(): void {
+  cached = null;
+  tried = false;
+}

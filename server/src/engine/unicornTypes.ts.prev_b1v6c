@@ -1,0 +1,100 @@
+// Единый словарь «что такое единорог», «что такое маска» и «откуда карту можно достать».
+// Раньше правило про единорогов было продублировано пятью копиями
+// (leader.ts isUnicorn, executor.ts isUnicornCategory, executor.ts matchesCardGroup,
+//  gameService.ts matchesCardGroup и два инлайновых isUni) и все включали лишний тип 'unicorn',
+// которого нет ни в одном каталоге. Здесь одна точка правды, остальные места делегируют сюда.
+// Зависимости: только shared/types и engine/state (типы) — цикла импортов не возникает.
+import { Card } from '../../../shared/src/types';
+import { GameState, PlayerState } from './state';
+
+// Четыре типа-единорога из каталога v2: Высший, Обычный, Магический, Малыш.
+// Типа 'unicorn' (generic) в данных нет — он был только в коде и удалён.
+export const UNICORN_TYPES = [
+  'ultimate_unicorn',
+  'basic_unicorn',
+  'magical_unicorn',
+  'baby_unicorn',
+] as const;
+
+export type UnicornType = (typeof UNICORN_TYPES)[number];
+
+// Единственная проверка «эта карта — единорог».
+export function isUnicornCard(type: Card['type'] | string | undefined | null): boolean {
+  if (!type) return false;
+  return (UNICORN_TYPES as readonly string[]).includes(String(type));
+}
+
+// Малыш достаётся только из Яслей: из колоды и сброса его взять нельзя.
+export function isNurseryOnly(card: Card | undefined): boolean {
+  return String((card as any)?.type || '') === 'baby_unicorn';
+}
+
+// Разрешено ли брать эту карту из указанной зоны.
+// Для всех карт, кроме Малыша, ограничений нет. Малыш — только из nursery.
+export function isCardAvailableFromZone(card: Card | undefined, zone: string | undefined): boolean {
+  if (!isNurseryOnly(card)) return true;
+  return String(zone || '') === 'nursery';
+}
+
+// Маска на карте-источнике. Два равнозначных способа записи в данных:
+//   1) поле карты mask: 'panda' | 'cat' | 'otter' | 'poop';
+//   2) эффект while_in_stable + действие set_flag{flag:'transforms_unicorn', value:'panda'}.
+// Второй способ — то, что реально лежит в catalog.v2.json у Пандамониума, Котострофы
+// и Выдропокалипсиса. Возвращает имя маски или null.
+export function maskOfCard(card: Card | undefined): string | null {
+  if (!card) return null;
+  const explicit = (card as any).mask;
+  if (typeof explicit === 'string' && explicit.trim() !== '') return explicit.trim();
+  const effects = ((card as any).effects as any[]) || [];
+  for (const eff of effects) {
+    if (!eff || eff.trigger !== 'while_in_stable') continue;
+    const actions = Array.isArray(eff.actions) ? eff.actions : [];
+    for (const a of actions) {
+      if (!a || a.kind !== 'set_flag') continue;
+      if (String(a.flag || '') !== 'transforms_unicorn') continue;
+      const v = a.value;
+      if (typeof v === 'string' && v.trim() !== '') return v.trim();
+    }
+  }
+  // Наследие: если на самой карте уже выставлен признак transforms_unicorn.
+  const legacy = (card as any).transforms_unicorn;
+  if (typeof legacy === 'string' && legacy.trim() !== '') return legacy.trim();
+  if (legacy === true) return 'mask';
+  return null;
+}
+
+// Маска игрока — аура: действует, пока штраф-источник лежит в конюшне этого игрока.
+// Ушёл штраф из стойла — маска снялась. Возвращает имя маски или null.
+export function maskOfPlayer(state: GameState, player: PlayerState): string | null {
+  if (!player) return null;
+  for (const cid of player.stable) {
+    const card = state.cards[cid];
+    const mask = maskOfCard(card);
+    if (mask) return mask;
+  }
+  return null;
+}
+
+// Маскированы ли единороги игрока (для расчёта победы).
+export function playerHasMask(state: GameState, player: PlayerState): boolean {
+  return maskOfPlayer(state, player) !== null;
+}
+
+// Карта — единорог в стойле игрока под маской.
+// Нужна для запрета target-действий (sacrifice/steal/destroy/move/swap).
+export function isMaskedUnicorn(state: GameState, card: Card | undefined, ownerId: string): boolean {
+  if (!card || !isUnicornCard(card.type)) return false;
+  const owner = state.players.find((p) => p.id === ownerId);
+  if (!owner) return false;
+  return playerHasMask(state, owner);
+}
+
+// Виды действий, которые не могут выбрать маскированного единорога целью.
+// Собственные эффекты замаскированной карты при этом продолжают работать:
+// запрет касается только «действия, у которого цель — единорог».
+export const MASK_BLOCKED_ACTION_KINDS = ['sacrifice', 'steal', 'destroy', 'move', 'swap'] as const;
+
+export function isActionBlockedByMask(actionKind: string | undefined): boolean {
+  if (!actionKind) return false;
+  return (MASK_BLOCKED_ACTION_KINDS as readonly string[]).includes(String(actionKind));
+}

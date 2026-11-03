@@ -1,0 +1,69 @@
+// Единый расчёт победителя по единорогам (тай-брейк конца игры по пустой колоде).
+// Вынесено из gameService.ts и engine/executor.ts, чтобы не было двух реализаций
+// и цикла импорта gameService -> engine/executor -> gameService.
+// Зависит только от engine/state и shared/types — импорт из сервиса и executor безопасен.
+import { Card } from '../../../shared/src/types';
+import { GameState, PlayerState } from './state';
+
+export function isUnicorn(type: Card['type']): boolean {
+  return (
+    type === 'unicorn' ||
+    type === 'baby_unicorn' ||
+    type === 'basic_unicorn' ||
+    type === 'magical_unicorn' ||
+    type === 'ultimate_unicorn'
+  );
+}
+
+// Число единорогов игрока для победы: counts_as_two учитывается, transforms_unicorn,
+// blocks_unicorn_effects и counts_for_win:false не засчитываются.
+export function countUnicornsForWin(state: GameState, player: PlayerState): number {
+  let total = 0;
+  for (const cid of player.stable) {
+    const c = state.cards[cid] as any;
+    if (!c) continue;
+    const transformed = !!c?.transforms_unicorn; // если true, карта не считается единорогом
+    if (transformed) continue;
+    if (isUnicorn((c.type as any)) && c?.blocks_unicorn_effects !== true) {
+      if (c?.counts_for_win === false) continue; // явно не засчитывается к победе
+      total += c?.counts_as_two ? 2 : 1;
+    }
+  }
+  return total;
+}
+
+// Единый тай-брейкер конца игры по пустой колоде (правило UU): больше единорогов с учётом
+// counts_as_two / counts_for_win / transforms_unicorn; при равенстве — больше букв в именах.
+export function leaderByUnicorns(state: GameState): string | null {
+  const countLetters = (s: string) => (s.match(/\p{L}/gu) || []).length;
+  let bestId: string | null = null;
+  let bestCount = -1;
+  let bestSymbols = -1;
+  for (const p of state.players) {
+    const cnt = countUnicornsForWin(state, p);
+    let symbols = 0;
+    for (const cid of p.stable) {
+      const c = state.cards[cid] as any;
+      if (!c) continue;
+      if (c?.transforms_unicorn) continue;
+      if (isUnicorn(c.type as any) && c?.blocks_unicorn_effects !== true && c?.counts_for_win !== false) {
+        symbols += countLetters(String(c.name || ''));
+      }
+    }
+    if (cnt > bestCount || (cnt === bestCount && symbols > bestSymbols)) {
+      bestCount = cnt;
+      bestSymbols = symbols;
+      bestId = p.id;
+    }
+  }
+  return bestId;
+}
+
+// Конец игры по пустой колоде. Уже выставленного победителя не перерешаем.
+export function maybeEndOnDeckEmpty(state: GameState): void {
+  // Партия кончается, только когда пусты и колода, и сброс (иначе сброс перетасуется).
+  if ((state.deck?.length ?? 0) > 0) return;
+  if ((state.discard?.length ?? 0) > 0) return;
+  if ((state as any).winnerId) return;
+  (state as any).winnerId = leaderByUnicorns(state);
+}

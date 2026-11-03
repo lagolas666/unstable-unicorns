@@ -1,0 +1,1118 @@
+import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
+import { EventBus } from '../engine/events';
+import { GameState, PlayerState } from '../engine/state';
+import { resolveEffect, ResolveContext, resolveActions, triggerTurnStartEffects, TurnStartPrompt } from '../engine/executor';
+import { Card, Effect } from '../../../shared/src/types';
+import CardModel from '../models/Card';
+import { applyCanReactFlagsToDict } from '../data/canReactFlags';
+import { loadCatalogFixture } from '../data/catalog';
+
+// In-memory game storage for prototype
+type LogEntry = { t: number; type: 'draw' | 'play' | 'end' | 'react' | 'discard' | 'turn_start_effect' | 'trigger_effect' | 'debug'; playerId?: string; details?: any };
+// Задача 6b: типы pending-состояния и объект games вынесены в ../gameStore
+import { games, Pending, PendingPlay, PendingPrompt, PendingTurnStartEffect, PendingTriggerEffect, PendingPlayCore } from '../gameStore';
+import { playCard, endTurn, drawCard, schedulePendingResolution, ctxFor, performPlayNow, matchesCardGroup, currentHandLimit, checkWin, countUnicornsForWin, isUnicorn, hasDangerousEffect, hasUnicornOnPlayEffect, maybeEndOnDeckEmpty, HAND_LIMIT_BASE, WIN_UNICORNS_BASE , reactRedirect, reactInterceptSteal, reactIntercept, reactPrevent, reactIgnoreTarget, reactNeigh, reactCounterNeigh, reactHypnorog, reactRewind, reactSuperNeigh, reactFrankencornIntercept, reactPlayAsInstant, reactShield, reactObjection, resolvePendingNow } from '../gameService';
+
+
+function makeId() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+// Helper: detect if any player controls a card that blocks others from playing Neigh-like instants
+function findNeighBlockOwner(state: GameState): string | null {
+  for (const p of state.players) {
+    for (const cid of p.stable) {
+      const c = (state.cards as any)[cid] as any;
+      if (!c) continue;
+      // General flag support
+      if (c.block_neigh_for_others === true) return p.id;
+      // Back-compat: Elusive Oceloticorn by name
+      const name = String((c?.name || c?.Название || '')).toLowerCase();
+      if (name === 'elusive oceloticorn' || name.includes('oceloticorn')) return p.id;
+    }
+  }
+  return null;
+}
+
+
+
+// Helper: schedule auto-resolution of a pending play after a timeout; resets existing timer
+
+
+const router = Router();
+
+// Config defaults (can be moved to state/config later)
+
+
+// POST /api/game
+// body: { players: [{ id: string, deckCardIds?: string[] }]} -> initialize game with shuffled decks
+router.post('/', async (req, res) => {
+  try {
+    const { players } = req.body as { players: { id: string; deckCardIds?: string[]; seedTop?: string[] }[] };
+    if (!players || players.length < 2) return res.status(400).json({ message: 'Need at least 2 players' });
+
+    // Load all cards dictionary (optional DB)
+    let cards: Card[] = [] as any;
+    try {
+      // DEF-06: без активного соединения mongoose буферизует запрос и висит bufferTimeoutMS (10 с).
+      // Если соединения нет — сразу используем встроенный seed ниже, ответ остаётся прежним.
+      if (mongoose.connection.readyState === 1) {
+        cards = await CardModel.find().lean<Card[]>();
+      }
+    } catch (_) {
+      // no DB available; continue with seed
+      cards = [] as any;
+    }
+
+    const dict: Record<string, Card> = {} as any;
+    for (const c of cards) dict[(c as any)._id || (c as any).id || (c as any).id] = c as any;
+
+    // Without Mongo: real card catalog from server/data/catalog.fixture.json (565 cards, 95 baby_unicorn).
+    // Needed so Nursery distribution and reaction windows can be checked on real data (TC-026).
+    // Test seed below stays as the last fallback: if the fixture is missing, behaviour is unchanged.
+    if (Object.keys(dict).length === 0) {
+      const fixture = loadCatalogFixture();
+      for (const c of fixture) {
+        const key = (c as any).id || (c as any)._id;
+        if (key) dict[key] = c as any;
+      }
+    }
+
+    // Last-resort test seed: no baby_unicorn and no Neigh cards in it.
+    if (Object.keys(dict).length === 0) {
+      const seed: Array<Partial<Card> & { id: string }> = [
+        { id: 'c_basic_1', name: 'Базовый Единорог', type: 'basic_unicorn' as any, effects: [] as any },
+        { id: 'c_magic_draw', name: 'Магия: Возьми 1', type: 'magic' as any, effects: [ { trigger: 'immediate', actions: [ { kind: 'add', source: 'deck', destination: 'hand', quantity: { value: 1 } } ] } ] as any },
+        { id: 'c_magic_search', name: 'Магия: Поиск 1', type: 'magic' as any, effects: [ { trigger: 'immediate', actions: [ { kind: 'search', targets: { scope: 'self', zone: 'deck', quantity: { value: 1 } } } ] } ] as any },
+        // Тестовая карта: Уничтожь 1 единорога у оппонента
+        { id: 'c_magic_destroy1', name: 'Магия: Уничтожь 1', type: 'magic' as any, effects: [ { trigger: 'immediate', actions: [ { kind: 'destroy', targets: { scope: 'opponent', zone: 'stable', quantity: { value: 1 }, filters: { card_group: 'unicorn' } } } ] } ] as any },
+        // Тестовая карта: Укради 1 единорога у оппонента
+        { id: 'c_magic_steal1', name: 'Магия: Укради 1', type: 'magic' as any, effects: [ { trigger: 'immediate', actions: [ { kind: 'steal', from: { scope: 'opponent', zone: 'stable', quantity: { value: 1 }, filters: { card_group: 'unicorn' } }, to: { scope: 'self', zone: 'stable' } } ] } ] as any },
+      ];
+      for (const s of seed) (dict as any)[s.id] = s as Card;
+    }
+    // Флаги реакций по имени карты (таблица data/canReactFlags.ts) — единая точка наложения
+    applyCanReactFlagsToDict(dict);
+
+    const allIds = Object.keys(dict);
+    const playerStates: PlayerState[] = players.map((p) => ({
+      id: p.id,
+      deck: [], // per-player decks not used with shared deck
+      hand: [],
+      discard: [],
+      stable: [],
+      nursery: [],
+      field: [],
+      action_points: 1,
+    }));
+
+    // Build a single shared deck for the whole table.
+    // Число копий каждой карты берётся из настройки админки: card.deck_count (по умолчанию 1).
+    // Карты с active === false и с deck_count <= 0 в колоду не попадают.
+    // Baby-единороги в основную колоду не идут — они живут в отдельной колоде Nursery (см. ниже).
+    let shared: string[] = [];
+    for (const cid of allIds) {
+      const card: any = (dict as any)[cid];
+      if (card?.active === false) continue;
+      if (String(card?.type) === 'baby_unicorn') continue;
+      const rawCount: any = card?.deck_count;
+      const n = Number(rawCount);
+      const count = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 1;
+      for (let i = 0; i < count; i++) shared.push(cid);
+    }
+    // Shuffle shared deck
+    for (let i = shared.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shared[i], shared[j]] = [shared[j], shared[i]];
+    }
+
+    // Отдельная колода Nursery: baby-единороги по копиям из той же настройки админки.
+    const nurseryIds: string[] = [];
+    for (const cid of allIds) {
+      const card: any = (dict as any)[cid];
+      if (String(card?.type) !== 'baby_unicorn') continue;
+      if (card?.active === false) continue;
+      const rawCount: any = card?.deck_count;
+      const n = Number(rawCount);
+      const count = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 1;
+      for (let i = 0; i < count; i++) nurseryIds.push(cid);
+    }
+
+    const state: GameState = {
+      players: playerStates,
+      turn: { currentPlayerId: playerStates[0].id, phase: 'begin_turn', has_drawn: false },
+      cards: dict,
+      deck: shared,
+      discard: [],
+      nursery: nurseryIds,
+    };
+    const bus = new EventBus();
+
+    const id = makeId();
+    games.set(id, { state, bus, logs: [], pending: null });
+
+    // After shuffle, optionally place seedTop cards on top of the SHARED deck (top is end of array)
+    // For now, only the first provided non-empty seedTop is respected (prototype helper)
+    const firstSeed = players.find(p => (p as any).seedTop && (p as any).seedTop.length) as any;
+    if (firstSeed?.seedTop?.length) {
+      for (const cid of firstSeed.seedTop as string[]) {
+        const pos = state.deck!.indexOf(cid);
+        if (pos !== -1) {
+          state.deck!.splice(pos, 1);
+          state.deck!.push(cid);
+        }
+      }
+    }
+
+    // Каждый игрок начинает с Baby Unicorn в стойле. Baby берётся из колоды Nursery,
+    // основная колода baby не содержит (см. сборку shared выше).
+    // Если в каталоге нет baby-карты — заводим служебную, чтобы старт игры не падал.
+    // Каждый игрок получает СВОЮ копию из Nursery: брать один и тот же babyId на всех нельзя,
+    // иначе один экземпляр оказывается в стойлах всех игроков, а Nursery теряет 1 карту вместо N.
+    if (!state.nursery) state.nursery = [];
+    const nursery = state.nursery;
+    state.players.forEach((ps, i) => {
+      let idx = nursery.findIndex((cid: string) => (dict as any)[cid]?.type === 'baby_unicorn');
+      let babyId: string;
+      if (idx !== -1) {
+        babyId = nursery[idx];
+        nursery.splice(idx, 1);
+      } else {
+        // Nursery исчерпан — заводим служебную копию, чтобы игрок не остался без стойла
+        babyId = 'c_baby_unicorn_' + (i + 1);
+        (dict as any)[babyId] = { id: babyId, name: 'Малыш Единорог', type: 'baby_unicorn', effects: [] } as any;
+      }
+      ps.stable.push(babyId);
+    });
+
+    // Draw 5 each as a starting hand
+    for (const ps of state.players) {
+      for (let i = 0; i < 5; i++) {
+        const top = state.deck!.pop();
+        if (top) ps.hand.push(top);
+      }
+    }
+
+    // Emit create event (optional initial broadcast)
+    try { const io: any = (req.app as any).get('io'); io?.to?.(`game:${id}`)?.emit?.('state_update', { id, state }); } catch {}
+    res.status(201).json({ id, state });
+  } catch (e) {
+    res.status(500).json({ message: 'Failed to create game' });
+  }
+});
+
+// GET /api/game/:id
+router.get('/:id', (req, res) => {
+  const g = games.get(req.params.id);
+  if (!g) return res.status(404).json({ message: 'Game not found' });
+  res.json(g.state);
+});
+
+// GET /api/game/:id/discard?playerId=...
+// Возвращает массив cardIds из сброса: общий (state.discard) или конкретного игрока (player.discard)
+router.get('/:id/discard', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const playerId = req.query.playerId ? String(req.query.playerId) : '';
+  if (playerId) {
+    const p = state.players.find(pl => pl.id === playerId);
+    if (!p) return res.status(404).json({ message: 'Player not found' });
+    return res.json({ discard: p.discard.slice(), topAtEnd: true });
+  }
+  return res.json({ discard: (state.discard || []).slice(), topAtEnd: true });
+});
+
+// GET /api/game/:id/effectTargetOptions?sourceCardId=...&effectIdx=...&actionPart=from|targets
+// Возвращает варианты целей для конкретного эффекта карты (например, выбор карты из сброса на on_turn_start)
+router.get('/:id/effectTargetOptions', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const current = state.players.find(p => p.id === state.turn.currentPlayerId)!;
+  const sourceCardId = String(req.query.sourceCardId || '');
+  const effectIdx = Number(req.query.effectIdx ?? -1);
+  const actionPart = String(req.query.actionPart || 'from'); // селектор берём из from или targets
+  if (!sourceCardId) return res.status(400).json({ message: 'sourceCardId required' });
+  const card = state.cards[sourceCardId] as any;
+  if (!card) return res.status(404).json({ message: 'Card not found' });
+  const effects = (card.effects as any[]) || [];
+  if (effectIdx < 0 || effectIdx >= effects.length) return res.status(400).json({ message: 'Invalid effectIdx' });
+  const eff = effects[effectIdx] as any;
+  if (!eff || !Array.isArray(eff.actions)) return res.json({ targets: [] });
+  // Берём первую action, содержащую указанный селектор
+  const action = eff.actions.find((a: any) => a && (a[actionPart] || a.targets)) as any;
+  const sel = (action?.[actionPart]) || action?.targets || {};
+  const scope = String(sel?.scope || 'self');
+  const zone = String(sel?.zone || 'stable');
+  const group = sel?.filters?.card_group as string | undefined;
+  let owners = [] as typeof state.players;
+  switch (scope) {
+    case 'self': owners = [current]; break;
+    case 'opponent': owners = state.players.filter(p => p.id !== current.id); break;
+    case 'any_player':
+    case 'all_players': owners = state.players.slice(); break;
+    default: owners = [current]; break;
+  }
+  const zoneGetter = (p: any): string[] => zone === 'stable' ? p.stable
+    : zone === 'hand' ? p.hand
+    : zone === 'discard' ? p.discard
+    : zone === 'nursery' ? p.nursery
+    : zone === 'field' ? p.field
+    : zone === 'deck' ? (state.deck || [])
+    : [];
+  const result: string[] = [];
+  for (const own of owners) {
+    const arr = zoneGetter(own);
+    for (const id of arr) {
+      const c = state.cards[id] as any;
+      if (matchesCardGroup(c, group)) result.push(id);
+    }
+  }
+  return res.json({ targets: result, selector: { scope, zone, filters: sel?.filters || null } });
+});
+
+// GET /api/game/:id/targetOptions?cardId=...&kind=destroy
+// Returns a list of valid target cardIds for the specified card's first matching action (defaults to destroy)
+router.get('/:id/targetOptions', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const current = state.players.find(p => p.id === state.turn.currentPlayerId)!;
+  const cardId = String(req.query.cardId || '');
+  const kind = String(req.query.kind || 'destroy');
+  const mode = String(req.query.mode || 'cards'); // 'cards' | 'players'
+  if (!cardId) return res.status(400).json({ message: 'cardId required' });
+  const card = state.cards[cardId] as any;
+  if (!card) return res.status(404).json({ message: 'Card not found' });
+  const effects = (card.effects as any[]) || [];
+  const eff = effects.find((ef) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions) && ef.actions.some((a: any) => a.kind === kind));
+  if (!eff) return res.json({ targets: [] });
+  const action = eff.actions.find((a: any) => a.kind === kind) as any;
+  // Player-selection mode: return candidate playerIds for destination (to.scope) or selector scope
+  if (mode === 'players') {
+    const to = action?.to || {};
+    const scope = String((to?.scope ?? (action?.targets?.scope)) || 'opponent');
+    let owners = [] as typeof state.players;
+    switch (scope) {
+      case 'self': owners = [current]; break;
+      case 'opponent': owners = state.players.filter(p => p.id !== current.id); break;
+      case 'any_player':
+      case 'all_players': owners = state.players.slice(); break;
+      default: owners = [current]; break;
+    }
+    return res.json({ players: owners.map(p => p.id) });
+  }
+  const sel = action?.targets || action?.from || {};
+  const scope = String(sel?.scope || 'opponent');
+  const zone = String(sel?.zone || 'stable');
+  const group = sel?.filters?.card_group as string | undefined;
+  let owners = [] as typeof state.players;
+  switch (scope) {
+    case 'self': owners = [current]; break;
+    case 'opponent': owners = state.players.filter(p => p.id !== current.id); break;
+    case 'any_player':
+    case 'all_players': owners = state.players.slice(); break;
+    default: owners = [current]; break;
+  }
+  const result: string[] = [];
+  for (const p of owners) {
+    let arr: string[] = [];
+    if (zone === 'stable') arr = p.stable;
+    else if (zone === 'hand') arr = p.hand;
+    else if (zone === 'discard') arr = p.discard;
+    else if (zone === 'nursery') arr = p.nursery;
+    else if (zone === 'field') arr = p.field;
+    else if (zone === 'deck') arr = state.deck || [];
+    else arr = [];
+    for (const id of arr) {
+      const c = state.cards[id] as any;
+      if (matchesCardGroup(c, group)) result.push(id);
+    }
+  }
+  res.json({ targets: result });
+});
+
+
+// POST /api/game/:id/turnStart
+// resolve on_turn_start effects for current player; stays in begin_turn
+router.post('/:id/turnStart', async (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  if (state.turn.phase !== 'begin_turn') {
+    return res.status(400).json({ message: 'Not in begin_turn' });
+  }
+  const { ctx, current } = ctxFor(req.params.id)!;
+  const prompts = await triggerTurnStartEffects(ctx, current.id);
+  if (prompts.length > 0) {
+    entry.pending = { kind: 'prompt', actorId: current.id, prompts } as PendingPrompt;
+    try {
+      const io: any = (req.app as any).get('io');
+      io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+    } catch {}
+  }
+  entry.logs.push({ t: Date.now(), type: 'play', playerId: current.id, details: { turnStartResolved: prompts.length === 0 } });
+  // Check win after start-of-turn effects
+  const winnerStart = checkWin(state);
+  // Победитель уже объявлен — не перезаписываем (winnerId = защёлка)
+  if (winnerStart && !(state as any).winnerId) (state as any).winnerId = winnerStart;
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+  } catch {}
+  return res.json({ state, pending: entry.pending });
+});
+
+// POST /api/game/:id/draw -> официальный добор; вся логика в gameService.drawCard
+// (одна реализация на REST и socket, задача 6b-3c-1)
+router.post('/:id/draw', async (req, res) => {
+  const entry = games.get(String(req.params.id));
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  // REST playerId не передаёт — подставляем текущего, чужие ходы отсекает сервис
+  const playerId = String(req.body?.playerId || '') || entry.state.turn.currentPlayerId;
+  const result = await drawCard(String(req.params.id), playerId, { via: 'rest' });
+  if (!result.ok) {
+    // D1: extra несёт признак оконченной партии ({ gameOver, winnerId })
+    const payload: any = { message: result.message };
+    if (result.extra) Object.assign(payload, result.extra);
+    return res.status(result.http).json(payload);
+  }
+  const state = result.state;
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+  } catch {}
+  return res.json(state);
+});
+
+// POST /api/game/:id/turnStart/activate { sourceCardId: string, effectIdx: number, targets?: string[], targetPlayerId?: string }
+// Активирует опциональный on_turn_start эффект через кнопку на карте: ищет соответствующий промпт и создаёт окно реакции
+router.post('/:id/turnStart/activate', async (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  if (state.turn.phase !== 'begin_turn') return res.status(400).json({ message: 'Not in begin_turn' });
+  if (!entry.pending || (entry.pending as any).kind !== 'prompt') return res.status(400).json({ message: 'No pending prompt' });
+  const pp = entry.pending as PendingPrompt;
+  const currentPid = state.turn.currentPlayerId;
+  if (pp.actorId !== currentPid) return res.status(403).json({ message: 'Not your prompt' });
+  const sourceCardId = String(req.body?.sourceCardId || '');
+  const effectIdx = Number.isInteger(req.body?.effectIdx) ? Number(req.body.effectIdx) : -1;
+  if (!sourceCardId || effectIdx < 0) return res.status(400).json({ message: 'sourceCardId and effectIdx required' });
+  const pi = pp.prompts.findIndex(p => p.sourceCardId === sourceCardId && p.effectIdx === effectIdx);
+  if (pi === -1) return res.status(404).json({ message: 'Prompt not found for card/effect' });
+  const prompt = pp.prompts[pi];
+  // удаляем промпт
+  pp.prompts.splice(pi, 1);
+  const targets: string[] = Array.isArray(req.body?.targets) ? req.body.targets.map(String) : [];
+  const targetPlayerId: string | undefined = req.body?.targetPlayerId ? String(req.body.targetPlayerId) : undefined;
+  const player = state.players.find(p => p.id === currentPid)!;
+  const card = state.cards[sourceCardId] as any;
+  const eff = (card?.effects || [])[effectIdx] as any;
+  if (!eff || eff.trigger !== 'on_turn_start') return res.status(400).json({ message: 'Effect is not on_turn_start' });
+  const uncounterable = !!eff.uncounterable;
+  if (uncounterable) {
+    // Если эффект содержит steal (allow_intercept), открываем окно реакции для Intercept,
+    // но с флагом uncounterable, чтобы запретить Neigh/Counter Neigh.
+    const hasSteal = Array.isArray(eff.actions) && eff.actions.some((a: any) => a && a.kind === 'steal');
+    if (hasSteal) {
+      entry.pending = {
+        kind: 'turn_start_effect',
+        actorId: player.id,
+        sourceCardId,
+        effectIdx,
+        uncounterable: true,
+        allow_intercept: true,
+        preTargets: targets.length ? targets : undefined,
+        preTargetPlayerId: targetPlayerId || undefined,
+        expiresAt: Date.now() + 5000,
+      } as any;
+      try {
+        const io: any = (req.app as any).get('io');
+        io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+      } catch {}
+      schedulePendingResolution(req.params.id, 5000);
+      return res.json({ state, pending: entry.pending });
+    } else {
+      const { ctx } = ctxFor(req.params.id)!;
+      if (targets.length) {
+        (ctx as any).selectedTargets = (ctx as any).selectedTargets || {};
+        (ctx as any).selectedTargets[sourceCardId] = targets;
+      }
+      if (targetPlayerId) {
+        (ctx as any).selectedPlayers = (ctx as any).selectedPlayers || {};
+        (ctx as any).selectedPlayers[sourceCardId] = targetPlayerId;
+      }
+      // Немедленное разрешение uncounterable-эффекта
+      await resolveEffect(ctx, player, sourceCardId, eff);
+      entry.logs.push({ t: Date.now(), type: 'turn_start_effect', playerId: player.id, details: { sourceCardId, effectIdx, auto: true } });
+      // Сохранить pending, если ещё есть другие промпты
+      if (!pp.prompts.length) {
+        entry.pending = null as any;
+      }
+      try {
+        const io: any = (req.app as any).get('io');
+        io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+        io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+      } catch {}
+      return res.json({ state, pending: entry.pending });
+    }
+  }
+  // Создаём окно реакции
+  entry.pending = {
+    kind: 'turn_start_effect',
+    actorId: player.id,
+    sourceCardId,
+    effectIdx,
+    uncounterable: false,
+    preTargets: targets.length ? targets : undefined,
+    preTargetPlayerId: targetPlayerId || undefined,
+    expiresAt: Date.now() + 5000,
+  } as any;
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+  } catch {}
+  schedulePendingResolution(req.params.id, 5000);
+  return res.json({ state, pending: entry.pending });
+});
+
+// POST /api/game/:id/turnStart/choose { choice: 'use'|'skip', promptIndex?: number, targets?: string[], targetPlayerId?: string }
+router.post('/:id/turnStart/choose', async (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  // Only current player during begin_turn may resolve prompts
+  if (state.turn.phase !== 'begin_turn') return res.status(400).json({ message: 'Not in begin_turn' });
+  if (!entry.pending || (entry.pending as any).kind !== 'prompt') return res.status(400).json({ message: 'No pending prompt' });
+  const pp = entry.pending as PendingPrompt;
+  const currentPid = state.turn.currentPlayerId;
+  if (pp.actorId !== currentPid) return res.status(403).json({ message: 'Not your prompt' });
+  const choice = String(req.body?.choice || 'skip') as 'use'|'skip';
+  const idx = Number.isInteger(req.body?.promptIndex) ? Number(req.body.promptIndex) : 0;
+  if (!pp.prompts.length) return res.status(400).json({ message: 'No prompts to resolve' });
+  if (idx < 0 || idx >= pp.prompts.length) return res.status(400).json({ message: 'Invalid prompt index' });
+  const prompt = pp.prompts[idx];
+  // Execute effect if chosen
+  if (choice === 'use') {
+    const { ctx, current } = ctxFor(req.params.id)!;
+    // Проброс явного выбора целей/получателя
+    const targets: string[] = Array.isArray(req.body?.targets) ? req.body.targets.map(String) : [];
+    const targetPlayerId: string | undefined = req.body?.targetPlayerId ? String(req.body.targetPlayerId) : undefined;
+    if (targets.length > 0) {
+      (ctx as any).selectedTargets = (ctx as any).selectedTargets || {};
+      (ctx as any).selectedTargets[prompt.sourceCardId] = targets;
+    }
+    if (targetPlayerId) {
+      (ctx as any).selectedPlayers = (ctx as any).selectedPlayers || {};
+      (ctx as any).selectedPlayers[prompt.sourceCardId] = targetPlayerId;
+    }
+    const player = state.players.find(p => p.id === current.id)!;
+    const card = state.cards[prompt.sourceCardId] as any;
+    if (card && Array.isArray(card.effects)) {
+      const eff = (card.effects as any[])[prompt.effectIdx] as any;
+      if (eff && eff.trigger === 'on_turn_start') {
+        const typeStr = String(card.type || '');
+        const isUnicornType = typeStr === 'unicorn' || typeStr === 'baby_unicorn' || typeStr === 'basic_unicorn' || typeStr === 'magical_unicorn' || typeStr === 'ultimate_unicorn';
+        const uncounterable = !!eff.uncounterable;
+        const matchesGroup = (cc: any, group?: string) => {
+          if (!group || group === 'any') return true;
+          if (!cc) return false;
+          switch (group) {
+            case 'unicorn':
+              return ['unicorn','baby_unicorn','basic_unicorn','magical_unicorn','ultimate_unicorn'].includes(String(cc.type));
+            case 'upgrade':
+            case 'downgrade':
+            case 'instant':
+            case 'magic':
+              return String(cc.type) === group;
+            default:
+              return true;
+          }
+        };
+        // Предвалидация: если в эффекте есть discard с требуемым количеством, убедимся, что карт хватает
+        try {
+          const discardAct = Array.isArray(eff.actions) ? (eff.actions as any[]).find(a => String(a?.kind) === 'discard') : undefined;
+          if (discardAct && discardAct.targets) {
+            const sel: any = discardAct.targets;
+            const qty = Number(sel?.quantity?.value ?? 1);
+            const zone = String(sel?.zone || 'hand');
+            const group = sel?.filters?.card_group as string | undefined;
+            // Поддерживаем только self для discard в on_turn_start (что соответствует текущим тестам)
+            const srcArr = zone === 'hand' ? player.hand : zone === 'stable' ? player.stable : [];
+            let candidates = 0;
+            for (const id of srcArr) {
+              const c = state.cards[id] as any;
+              if (matchesGroup(c as any, group)) candidates++;
+            }
+            if (candidates < qty) {
+              return res.status(422).json({ message: `Not enough cards to discard (${candidates}/${qty})` });
+            }
+          }
+        } catch {}
+        if (!uncounterable && isUnicornType) {
+          // auto-cancel by opponent Hypnorog if available
+          const opponent = state.players.find(p => p.id !== player.id) || null;
+          if (opponent) {
+            const hasHyp = (opponent.stable || []).some(cid => {
+              const c = state.cards[cid] as any;
+              return c && (c.blocks_unicorn_effects === true);
+            });
+            if (hasHyp && (opponent.hand?.length || 0) > 0) {
+              const dcard = opponent.hand.shift() as string;
+              opponent.discard.push(dcard);
+              entry.logs.push({ t: Date.now(), type: 'react', playerId: opponent.id, details: { kind: 'hypnorog:auto_cancel', source: prompt.sourceCardId, discardCardId: dcard } });
+              // Effect canceled; do not execute
+              // No pending window is created per current tests
+              try {
+                const io: any = (req.app as any).get('io');
+                io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+                io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+              } catch {}
+              return res.json({ state, pending: entry.pending });
+            }
+          }
+        }
+        // No auto-cancel -> execute immediately
+        await resolveEffect(ctx, player, prompt.sourceCardId, eff);
+      }
+    }
+  }
+  // Удаляем промпт после обработки выбора
+  pp.prompts.splice(idx, 1);
+  // If no more prompts, clear pending
+  if (pp.prompts.length === 0) {
+    entry.pending = null;
+  }
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+  } catch {}
+  return res.json({ state, pending: entry.pending });
+});
+
+// --- Test-only helpers (available only under NODE_ENV === 'test') ---
+if (process.env.NODE_ENV === 'test') {
+  // POST /api/game/test/create { id?: string, state?: Partial<GameState> }
+  router.post('/test/create', (req, res) => {
+    const id = String(req.body?.id || makeId());
+    const baseState: GameState = {
+      players: [],
+      turn: { currentPlayerId: '', phase: 'action', has_drawn: false },
+      cards: {},
+      deck: [],
+      discard: [],
+    } as any;
+    const payload = (req.body?.state || {}) as Partial<GameState>;
+    const merged: GameState = {
+      ...baseState,
+      ...payload,
+      turn: { ...baseState.turn, ...(payload.turn || {}) },
+    } as any;
+    if (!merged.discard) (merged as any).discard = [];
+    if (!merged.deck) (merged as any).deck = [];
+    const entry = { state: merged, bus: new EventBus(), logs: [], pending: null as any };
+    games.set(id, entry);
+    return res.json({ id, state: merged });
+  });
+
+  // GET /api/game/test/state/:id -> { state, pending, logs }
+  router.get('/test/state/:id', (req, res) => {
+    const entry = games.get(req.params.id);
+    if (!entry) return res.status(404).json({ message: 'Game not found' });
+    return res.json({ state: entry.state, pending: entry.pending, logs: entry.logs });
+  });
+
+  // POST /api/game/test/set/:id { state: Partial<GameState> }
+  router.post('/test/set/:id', (req, res) => {
+    const entry = games.get(req.params.id);
+    if (!entry) return res.status(404).json({ message: 'Game not found' });
+    const payload = (req.body?.state || {}) as Partial<GameState> & { pending?: any };
+    entry.state = { ...entry.state, ...payload, turn: { ...entry.state.turn, ...(payload.turn || {}) } } as any;
+    if (Object.prototype.hasOwnProperty.call(payload, 'pending')) {
+      (entry as any).pending = (payload as any).pending || null;
+      // если передан expiresAt — обновим таймер
+      const exp = Number((entry as any).pending?.expiresAt || 0);
+      if (exp > 0) {
+        const remaining = Math.max(0, exp - Date.now());
+        schedulePendingResolution(req.params.id, Math.max(500, remaining));
+      }
+    }
+    return res.json({ state: entry.state });
+  });
+}
+
+// POST /api/game/:id/react/redirect { byPlayerId?: string, instantCardId?: string, toTargetId: string }
+router.post('/:id/react/redirect', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactRedirect(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/intercept_steal { byPlayerId?: string, instantCardId?: string, receiverPlayerId?: string }
+router.post('/:id/react/intercept_steal', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactInterceptSteal(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/playWithTargets { cardId: string, targets: string[] }
+// Same as /play, but accepts explicit target IDs for effects that require selection (e.g., destroy)
+router.post('/:id/playWithTargets', async (req: Request, res: Response) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const player = state.players.find((p) => p.id === state.turn.currentPlayerId)!;
+  const cardId = String(req.body?.cardId || '');
+  const targets = Array.isArray(req.body?.targets) ? (req.body.targets as string[]) : [];
+  const targetPlayerId = req.body?.targetPlayerId ? String(req.body.targetPlayerId) : '';
+  if (state.turn.phase !== 'action') return res.status(400).json({ message: 'Not in action phase' });
+  if (player.action_points <= 0) return res.status(400).json({ message: 'No action points' });
+  const idx = player.hand.indexOf(cardId);
+  if (idx === -1) return res.status(400).json({ message: 'Card not in hand' });
+  // Do not remove from hand until all validations/costs pass
+  const card = state.cards[cardId];
+  const base = ctxFor(req.params.id)!;
+  // Basic validation for targets against the first destroy action (if any)
+  const effects = ((card as any)?.effects as any[]) || [];
+  const eff = effects.find((ef) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions) && ef.actions.some((a: any) => a.kind === 'destroy'));
+  if (eff) {
+    const action = eff.actions.find((a: any) => a.kind === 'destroy') as any;
+    const sel = action?.targets || {};
+    const qty = Number(sel?.quantity?.value ?? 1);
+    const scope = String(sel?.scope || 'opponent');
+    const zone = String(sel?.zone || 'stable');
+    const group = sel?.filters?.card_group as string | undefined;
+    // Too many targets provided
+    if (Array.isArray(targets) && targets.length > qty) {
+      return res.status(400).json({ message: `Too many targets provided (${targets.length}/${qty})` });
+    }
+    // Duplicate targets provided
+    if (Array.isArray(targets) && new Set(targets).size !== targets.length) {
+      return res.status(400).json({ message: 'Duplicate targets provided' });
+    }
+    if (!Array.isArray(targets) || targets.length < qty) {
+      const willOpenPending = hasDangerousEffect(card) || hasUnicornOnPlayEffect(card);
+      // Build owners list per scope to compute available target options
+      let ownersOpt = [] as typeof state.players;
+      switch (scope) {
+        case 'self': ownersOpt = [player]; break;
+        case 'opponent': ownersOpt = state.players.filter(p => p.id !== player.id); break;
+        case 'any_player':
+        case 'all_players': ownersOpt = state.players.slice(); break;
+        default: ownersOpt = [player]; break;
+      }
+      const zoneGetterOpt = (p: any): string[] => zone === 'stable' ? p.stable : zone === 'hand' ? p.hand : zone === 'discard' ? p.discard : zone === 'nursery' ? p.nursery : zone === 'field' ? p.field : zone === 'deck' ? (state.deck || []) : [];
+      const validTargets: string[] = [];
+      for (const own of ownersOpt) {
+        const arr = zoneGetterOpt(own);
+        for (const tid of arr) {
+          const c = state.cards[tid] as any;
+          if (matchesCardGroup(c, group)) validTargets.push(tid);
+        }
+      }
+      if (!willOpenPending || qty > 1) {
+        return res.status(409).json({
+          message: `Not enough targets provided (${targets?.length ?? 0}/${qty})`,
+          needTargets: true,
+          kind: 'targets',
+          options: { targets: validTargets },
+        });
+      }
+    }
+    // Build owners list per scope
+    let owners = [] as typeof state.players;
+    switch (scope) {
+      case 'self': owners = [player]; break;
+      case 'opponent': owners = state.players.filter(p => p.id !== player.id); break;
+      case 'any_player':
+      case 'all_players': owners = state.players.slice(); break;
+      default: owners = [player]; break;
+    }
+    const zoneGetter = (p: any): string[] => zone === 'stable' ? p.stable : zone === 'hand' ? p.hand : zone === 'discard' ? p.discard : zone === 'nursery' ? p.nursery : zone === 'field' ? p.field : zone === 'deck' ? (state.deck || []) : [];
+    // Validate each target
+    for (const tid of targets.slice(0, qty)) {
+      let ok = false;
+      for (const own of owners) {
+        const arr = zoneGetter(own);
+        if (arr.includes(tid)) {
+          const c = state.cards[tid] as any;
+          if (matchesCardGroup(c, group)) { ok = true; break; }
+        }
+      }
+      if (!ok) return res.status(400).json({ message: `Invalid target: ${tid}` });
+    }
+  }
+  // If dangerous effect OR unicorn with on_play/immediate effects, open reaction window and store preselected choices
+  if (hasDangerousEffect(card) || hasUnicornOnPlayEffect(card)) {
+    if (entry.pending) return res.status(400).json({ message: 'Another action pending' });
+    // Determine uncounterable based on the dangerous effect metadata
+    const effectsAll = ((card as any)?.effects as any[]) || [];
+    const firstOnPlay = effectsAll.find((ef: any) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions));
+    const uncounterable = !!(firstOnPlay && (firstOnPlay as any).uncounterable);
+    entry.pending = { kind: 'play', actorId: player.id, cardId, prefill: { targets, playerId: targetPlayerId || undefined }, cancelLevel: 0, expiresAt: Date.now() + 5000, uncounterable } as any;
+    // Stash preselected choices for later execution
+    (entry.pending as any).preTargets = targets;
+    if (targetPlayerId) (entry.pending as any).preTargetPlayerId = targetPlayerId;
+    schedulePendingResolution(req.params.id, 5000);
+    entry.logs.push({ t: Date.now(), type: 'play', playerId: player.id, details: { pending: 'play', cardId, via: 'playWithTargets:autoWindow', targets, targetPlayerId } });
+    try {
+      const io: any = (req.app as any).get('io');
+      io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+      io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+    } catch {}
+    return res.json({ pending: entry.pending, state });
+  }
+
+  const ctx = { ...base.ctx, selectedTargets: { [cardId]: targets }, selectedPlayers: targetPlayerId ? { [cardId]: targetPlayerId } : undefined } as ResolveContext;
+
+  // If the card is an upgrade/downgrade: for downgrade require choosing opponent; for upgrade default to self if not provided
+  const ctypePre = (card as any)?.type as string;
+  if (ctypePre === 'downgrade') {
+    const owners = state.players.filter(p => p.id !== player.id);
+    if (!targetPlayerId) {
+      return res.status(409).json({ message: 'Player target required', needTargets: true, kind: 'players', options: { players: owners.map(p => p.id) } });
+    }
+  }
+
+  // Before resolving costs, check if costs require explicit targets selection (discard/sacrifice)
+  const costs = (card as any)?.play_requirements?.costs as any[] | undefined;
+  if (costs && costs.length) {
+    // gather candidates
+    const need = costs.find((a: any) => ['discard','sacrifice'].includes(String(a.kind)));
+    if (need) {
+      const sel: any = need.targets || {};
+      const qty = Number(sel?.quantity?.value ?? 1);
+      const zone = String(sel?.zone || (need.kind === 'discard' ? 'hand' : 'stable'));
+      const group = sel?.filters?.card_group as string | undefined;
+      const srcArr = zone === 'hand' ? player.hand : zone === 'stable' ? player.stable : [];
+      const candidates: string[] = [];
+      for (const id of srcArr) {
+        const c = state.cards[id] as any;
+        if (matchesCardGroup(c, group)) candidates.push(id);
+      }
+      // DEF-04: нехватка кандидатов для оплаты cost — отказываем ДО resolveActions,
+      // иначе executor опустошает руку, и карта сгорает при провале оплаты
+      if (candidates.length < qty) {
+        return res.status(400).json({ message: 'Cannot pay costs' });
+      }
+      // if client hasn't preselected, ask to pick
+      const chosen = (ctx as any).selectedTargets?.[cardId] || [];
+      if (!Array.isArray(chosen) || chosen.length < qty) {
+        return res.status(409).json({ message: 'Targets required', needTargets: true, kind: String(need.kind), options: { targets: candidates } });
+      }
+    }
+  }
+  // Resolve costs (ensure currentSourceId is set so executors can read selectedTargets for costs)
+  if (costs && costs.length) {
+    (ctx as any).currentSourceId = cardId;
+    const ok = await resolveActions(ctx, player, costs as any);
+    (ctx as any).currentSourceId = undefined;
+    if (!ok) {
+      return res.status(400).json({ message: 'Cannot pay costs' });
+    }
+  }
+
+  // Only now remove from hand
+  player.hand.splice(idx, 1);
+  // Place depending on card type
+  const ctype = (card as any)?.type as string;
+  if (ctype === 'magic' || ctype === 'instant') {
+    // Temporarily place nowhere; resolve effects then send to discard
+  } else if (ctype === 'upgrade' || ctype === 'downgrade') {
+    // Allow attaching to selected player's stable if provided
+    let owner: PlayerState = player;
+    const pid = targetPlayerId || ((ctx as any).selectedPlayers?.[cardId] as string | undefined);
+    if (pid) {
+      const o = state.players.find(p => p.id === pid);
+      if (o) owner = o;
+    }
+    owner.stable.push(cardId);
+  } else {
+    player.stable.push(cardId);
+  }
+
+  // Resolve on_play/immediate with provided targets
+  // Respect Hypnorog cancel if it was used in the reaction window for this pending play
+  const pLocalPwT = entry.pending as any;
+  const hypnoCanceledPwT = !!(pLocalPwT && pLocalPwT.kind === 'play' && pLocalPwT.cardId === cardId && pLocalPwT.hypnorog && pLocalPwT.hypnorog.cancel);
+  if (!hypnoCanceledPwT) {
+    const effects2 = (card?.effects as any as Effect[]) || [];
+    for (const ef of effects2) {
+      if ((ef as any).trigger === 'on_play' || (ef as any).trigger === 'immediate') {
+        await resolveEffect(ctx, player, cardId, ef);
+      }
+    }
+  }
+
+  // After resolving, handle magic/instant placement to discard
+  if (ctype === 'magic' || ctype === 'instant') {
+    if (!state.discard) (state as any).discard = [];
+    state.discard!.push(cardId);
+  }
+
+  // Spend AP and log
+  player.action_points = Math.max(0, (player.action_points || 0) - 1);
+  entry.logs.push({ t: Date.now(), type: 'play', playerId: player.id, details: { cardId, name: (state.cards as any)[cardId]?.name, via: 'playWithTargets', targets } });
+
+  const winner = checkWin(state);
+  // Победитель уже объявлен — не перезаписываем (winnerId = защёлка)
+  if (winner && !(state as any).winnerId) (state as any).winnerId = winner;
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+  } catch {}
+  res.json(state);
+});
+
+// POST /api/game/:id/play { cardId: string }
+router.post('/:id/play', async (req, res) => {
+  const cardId = String(req.body?.cardId || '');
+  // REST передаёт текущего игрока: проверка чужих ходов остаётся за сервисом
+  const entry0 = games.get(String(req.params.id));
+  if (!entry0) return res.status(404).json({ message: 'Game not found' });
+  const playerId = entry0.state.turn.currentPlayerId;
+  // Цели оплаты стоимости из тела запроса: без них ctx пересоздаётся и 409 не закрыть
+  const chosenCostTargets = req.body?.chosenCostTargets;
+  // Цель розыгрыша (upgrade/downgrade) и цели эффектов тоже приходят телом:
+  // без них /play всегда отвечал 409 на downgrade и клал карту в стойло актора.
+  const targetPlayerId = req.body?.targetPlayerId ? String(req.body.targetPlayerId) : undefined;
+  const targets = Array.isArray(req.body?.targets) ? (req.body.targets as unknown[]).map((t) => String(t)) : undefined;
+  const result = await playCard(String(req.params.id), playerId, cardId, { chosenCostTargets, targetPlayerId, targets });
+  if (!result.ok) {
+    const payload: any = { message: result.message };
+    if (result.extra) Object.assign(payload, result.extra);
+    return res.status(result.http).json(payload);
+  }
+  const state = result.state;
+  try {
+    const io: any = (req.app as any).get('io');
+    if (result.pending) {
+      io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', result.pending);
+      io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+    } else {
+      io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+      io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+    }
+  } catch {}
+  if (result.pending) return res.json({ pending: result.pending, state });
+  res.json(state);
+});
+
+// POST /api/game/:id/endTurn
+router.post('/:id/endTurn', async (req, res) => {
+  const result = await endTurn(String(req.params.id));
+  if (!result.ok) {
+    // D1: extra несёт признак оконченной партии ({ gameOver, winnerId })
+    const payload: any = { message: result.message };
+    if (result.extra) Object.assign(payload, result.extra);
+    return res.status(result.http).json(payload);
+  }
+  const state = result.state;
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+  } catch {}
+  res.json(state);
+});
+
+// GET /api/game/:id/logs
+router.get('/:id/logs', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  res.json(entry.logs.slice(-100));
+});
+
+export default router;
+
+// ========== Extensions: pass-draw, discard, and simple reaction window ==========
+
+// Helper to execute a play now (used by direct play and resolvePending)
+
+// POST /api/game/:id/passDraw
+// Action-phase substitute: draw 1 card instead of playing a card (consumes 1 action point)
+router.post('/:id/passDraw', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const player = state.players.find((p) => p.id === state.turn.currentPlayerId)!;
+  if (state.turn.phase !== 'action') {
+    return res.status(400).json({ message: 'Not in action phase' });
+  }
+  if (player.action_points <= 0) {
+    return res.status(400).json({ message: 'No action points' });
+  }
+  const top = state.deck?.pop();
+  if (top) player.hand.push(top);
+  player.action_points = Math.max(0, (player.action_points || 0) - 1);
+  maybeEndOnDeckEmpty(state);
+  entry.logs.push({ t: Date.now(), type: 'draw', playerId: player.id, details: { mode: 'substitute', qty: 1 } });
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+  } catch {}
+  res.json(state);
+});
+
+router.post('/:id/discard', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const player = state.players.find((p) => p.id === state.turn.currentPlayerId)!;
+  const cardId = String(req.body?.cardId || '');
+  // Allow manual discard during action or end_turn.
+  if (!(state.turn.phase === 'action' || state.turn.phase === 'end_turn')) {
+    return res.status(400).json({ message: 'Discard allowed only in action or end_turn' });
+  }
+  const idx = player.hand.indexOf(cardId);
+  if (idx === -1) return res.status(400).json({ message: 'Card not in hand' });
+  player.hand.splice(idx, 1);
+  player.discard.push(cardId);
+  entry.logs.push({ t: Date.now(), type: 'discard', playerId: player.id, details: { cardId } });
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+  } catch {}
+  res.json(state);
+});
+
+// --- Simple reaction window (Neigh) ---
+
+// POST /api/game/:id/playWithWindow { cardId }
+router.post('/:id/playWithWindow', (req, res) => {
+  const entry = games.get(req.params.id);
+  if (!entry) return res.status(404).json({ message: 'Game not found' });
+  const { state } = entry;
+  const actor = state.players.find((p) => p.id === state.turn.currentPlayerId)!;
+  const cardId = String(req.body?.cardId || '');
+  if (state.turn.phase !== 'action') return res.status(400).json({ message: 'Not in action phase' });
+  if (actor.action_points <= 0) return res.status(400).json({ message: 'No action points' });
+  if (!cardId) return res.status(400).json({ message: 'cardId required' });
+  if (entry.pending) return res.status(400).json({ message: 'Another action pending' });
+  const idx = actor.hand.indexOf(cardId);
+  if (idx === -1) return res.status(400).json({ message: 'Card not in hand' });
+  // Detect whether the dangerous on_play effect (if any) is uncounterable
+  const cdef = state.cards[cardId] as any;
+  const ceffects = (cdef?.effects as any[]) || [];
+  const dangerousEff = ceffects.find((ef) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions) && ef.actions.some((a: any) => ['destroy','steal','sacrifice'].includes(String(a.kind))));
+  // Карта может сама быть не «нейхабельной» при розыгрыше
+  const nameLower = String((cdef?.name || cdef?.Название || '')).toLowerCase();
+  const isElusiveOceloticorn = nameLower === 'elusive oceloticorn' || nameLower.includes('oceloticorn');
+  const uncounterable = !!(dangerousEff && (dangerousEff as any).uncounterable) || isElusiveOceloticorn || (cdef as any).cannot_be_neighed === true;
+  entry.pending = { kind: 'play', actorId: actor.id, cardId, cancelLevel: 0, expiresAt: Date.now() + 5000, uncounterable } as any;
+  entry.logs.push({ t: Date.now(), type: 'play', playerId: actor.id, details: { pending: 'play', cardId } });
+  try {
+    const io: any = (req.app as any).get('io');
+    io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+  } catch {}
+  schedulePendingResolution(req.params.id, 10000);
+  res.json({ pending: entry.pending, state });
+});
+
+
+// POST /api/game/:id/react/intercept { byPlayerId?: string, receiverPlayerId: string }
+router.post('/:id/react/intercept', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactIntercept(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/prevent { byPlayerId?: string }
+router.post('/:id/react/prevent', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactPrevent(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/ignore_target { byPlayerId?: string, targetId: string }
+router.post('/:id/react/ignore_target', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactIgnoreTarget(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/neigh { byPlayerId?: string, instantCardId?: string }
+router.post('/:id/react/neigh', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactNeigh(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/counter_neigh { byPlayerId?: string, instantCardId?: string }
+router.post('/:id/react/counter_neigh', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactCounterNeigh(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/hypnorog { byPlayerId?: string, discardCardId: string }
+router.post('/:id/react/hypnorog', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactHypnorog(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/rewind { byPlayerId?: string, instantCardId?: string }
+router.post('/:id/react/rewind', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactRewind(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/super_neigh { byPlayerId?: string, instantCardId?: string }
+router.post('/:id/react/super_neigh', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactSuperNeigh(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/frankencorn_intercept { byPlayerId: string }
+// Способность Frankencorn: когда другой игрок пытается сыграть карту (окно 'play'),
+// вы можете пожертвовать Frankencorn: остановить их карту, добавить её в свою руку и немедленно разыграть.
+router.post('/:id/react/frankencorn_intercept', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactFrankencornIntercept(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/play_as_instant { byPlayerId: string, cardId: string }
+// Разрешает разыгрывать карту из руки как мгновенную реакцию в чужое окно 'play',
+// если карта поддерживает такой режим (флаг can_be_played_as_instant=true или известная карта Chronocorn)
+router.post('/:id/react/play_as_instant', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactPlayAsInstant(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/shield { byPlayerId: string, instantCardId?: string }
+// Shield может сыграть только актёр текущего окна; делает окно неотменяемым (uncounterable=true)
+router.post('/:id/react/shield', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactShield(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/react/objection { byPlayerId: string, instantCardId?: string, discardCardId?: string }
+// Objection возвращает отменяющее Ржание владельцу и запрещает ему Ржать до конца хода
+router.post('/:id/react/objection', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await reactObjection(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
+
+// POST /api/game/:id/resolvePending
+router.post('/:id/resolvePending', async (req, res) => {
+  // 6b-3c-2: движок реакции в gameService, роут только транспорт
+  const outcome = await resolvePendingNow(req.params.id, req.body, (req.app as any).get('io'));
+  return res.status(outcome.http).json(outcome.body);
+});
