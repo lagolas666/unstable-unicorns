@@ -1,0 +1,7 @@
+{
+  "_comment": "Заполните этот манифест соответствиями НазваниеКарты -> путь к изображению в public/cards/. Пример: \n  \"Гипнорог\": \"/cards/magical/hypnocorn.png\",\n  \"Радужное Лассо\": \"/cards/magic/rainbow_lasso.png\"\n  Пути должны быть относительными от корня public (начинаться с /cards/).",
+  "examples": {
+    "Гипнорог": "/cards/magical/hypnocorn.png",
+    "Радужное Лассо": "/cards/magic/rainbow_lasso.png"
+  }
+}

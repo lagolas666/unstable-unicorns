@@ -1,0 +1,23 @@
+.turn-highlight {
+  animation: pulse 1s ease-in-out infinite;
+}
+.battle-banner {
+  animation: banner 1.5s ease-in-out;
+  display: inline-block;
+  padding: 6px 12px;
+  border-radius: 6px;
+  background: rgba(255, 210, 0, 0.9);
+  color: #2b1b0a;
+  font-weight: bold;
+  margin-bottom: 8px;
+}
+@keyframes pulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 rgba(0,0,0,0); }
+  50% { transform: scale(1.05); box-shadow: 0 0 12px rgba(0,0,0,0.2); }
+  100% { transform: scale(1); box-shadow: 0 0 0 rgba(0,0,0,0); }
+}
+@keyframes banner {
+  0% { transform: translateY(-2px); opacity: 0; }
+  50% { transform: translateY(0px); opacity: 1; }
+  100% { transform: translateY(2px); opacity: 1; }
+}
