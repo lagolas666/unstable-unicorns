@@ -1,0 +1,53 @@
+[
+  {
+    "name": "Кошмарный единорог",
+    "type": "ultimate_unicorn",
+    "description": "Когда эта карта кладётся в вашу Конюшню, пожертвуйте три карты. В начале вашего хода вы можете взять единорога из сброса и поместить в Конюшню.",
+    "tags": ["unicorn", "ultimate"],
+    "play_requirements": {
+      "conditions": [
+        { "kind": "count_in_zone", "player": "self", "zone": "stable", "op": ">=", "value": 3 },
+        { "kind": "flag", "name": "block_unicorn_enter_effects", "value": false }
+      ]
+    },
+    "effects": [
+      {
+        "trigger": "on_play",
+        "actions": [
+          {
+            "kind": "sacrifice",
+            "targets": {
+              "scope": "self",
+              "zone": "stable",
+              "filters": { "card_group": "any" },
+              "quantity": { "mode": "exact", "value": 3 }
+            }
+          }
+        ]
+      },
+      {
+        "trigger": "on_turn_start",
+        "while_source_in": "stable",
+        "optional": true,
+        "uncounterable": true,
+        "conditions": [
+          { "kind": "has_card", "player": "any_player", "zone": "discard", "filter": { "card_group": "unicorn" } },
+          { "kind": "flag", "name": "silence_unicorn_properties", "value": false }
+        ],
+        "actions": [
+          {
+            "kind": "move",
+            "from": {
+              "scope": "any_player",
+              "zone": "discard",
+              "filters": { "card_group": "unicorn" },
+              "quantity": { "mode": "exact", "value": 1 }
+            },
+            "to": { "scope": "self", "zone": "stable" },
+            "on_enter_mode": "as_on_play"
+          }
+        ]
+      }
+    ]
+  }
+]
