@@ -1,24 +1,67 @@
-# Node Modules
+# ===== Node =====
 node_modules/
-
-# Environment variables
-.env
-
-# Build output
-client/build/
-
-# Logs
-logs/
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.pnp
+.pnp.js
 
-# OS files
+# ===== Переменные окружения и секреты =====
+.env
+.env.*
+!.env.example
+figma.token
+*.pem
+*.key
+id_rsa*
+unicorns_deploy_pubkey.txt
+
+# ===== Сборка (пересобирается, не в репозиторий) =====
+build/
+dist/
+release/
+out/
+coverage/
+client/build/
+client/dist/
+server/dist/
+shared/dist/
+
+# ===== Логи и временные файлы агентов =====
+logs/
+*.log
+_ac_*
+_an_*
+_be_*
+_fe_*
+_te_*
+_ts_*
+_tmp*
+_*.js
+_*.json
+_*.txt
+_*.ps1
+_*.cjs
+*~
+~$*
+*.prev
+*.mutbak
+*.bak
+*.backup
+*.new
+
+# ===== Python (venv для сборщика инсталлятора) =====
+venv/
+__pycache__/
+*.pyc
+
+# ===== Загрузки и данные рантайма =====
+server/uploads/
+uploads/
+
+# ===== ОС и IDE =====
 .DS_Store
 Thumbs.db
-
-# IDE files
 .idea/
 .vscode/
 *.swp
