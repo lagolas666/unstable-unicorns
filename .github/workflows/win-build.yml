@@ -1,0 +1,32 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          .\venv\Scripts\activate.bat
+          pip install -r requirements.txt
+      - name: Build exe with PyInstaller
+        run: |
+          .\venv\Scripts\activate.bat
+          pyinstaller --windowed --onefile gui_app.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: gui_app_exe
+          path: dist\gui_app.exe

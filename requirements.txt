@@ -1,0 +1,5 @@
+pandas
+openpyxl
+reportlab
+pyinstaller
+python-docx
