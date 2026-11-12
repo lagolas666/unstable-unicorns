@@ -6628,6 +6628,7 @@
  },
  {
   "id": "angelic_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Angelic Baby Unicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6648,6 +6649,7 @@
  },
  {
   "id": "baby_archangel_unicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Archangel Unicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6658,6 +6660,7 @@
  },
  {
   "id": "baby_bearicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Bearicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6668,6 +6671,7 @@
  },
  {
   "id": "baby_belugacorn",
+  "source_zone": "nursery_only",
   "name": "Baby Belugacorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6678,6 +6682,7 @@
  },
  {
   "id": "baby_dragoncorn_black",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Black)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6688,6 +6693,7 @@
  },
  {
   "id": "baby_dragoncorn_blue",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Blue)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6698,6 +6704,7 @@
  },
  {
   "id": "baby_dragoncorn_green",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Green)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6708,6 +6715,7 @@
  },
  {
   "id": "baby_dragoncorn_orange",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Orange)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6718,6 +6726,7 @@
  },
  {
   "id": "baby_dragoncorn_pink",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Pink)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6728,6 +6737,7 @@
  },
  {
   "id": "baby_dragoncorn_red",
+  "source_zone": "nursery_only",
   "name": "Baby Dragoncorn (Red)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6738,6 +6748,7 @@
  },
  {
   "id": "baby_dwarficorn",
+  "source_zone": "nursery_only",
   "name": "Baby Dwarficorn",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6748,6 +6759,7 @@
  },
  {
   "id": "baby_elficorn",
+  "source_zone": "nursery_only",
   "name": "Baby Elficorn",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6758,6 +6770,7 @@
  },
  {
   "id": "baby_gnomicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Gnomicorn",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6768,6 +6781,7 @@
  },
  {
   "id": "baby_narwhal",
+  "source_zone": "nursery_only",
   "name": "Baby Narwhal",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6778,6 +6792,7 @@
  },
  {
   "id": "baby_nightmare_unicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Nightmare Unicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6788,6 +6803,7 @@
  },
  {
   "id": "baby_orcicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Orcicorn",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6798,6 +6814,7 @@
  },
  {
   "id": "baby_pegasuscorn",
+  "source_zone": "nursery_only",
   "name": "Baby Pegasuscorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6808,6 +6825,7 @@
  },
  {
   "id": "baby_penguincorn",
+  "source_zone": "nursery_only",
   "name": "Baby Penguincorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6818,6 +6836,7 @@
  },
  {
   "id": "baby_slothicorn",
+  "source_zone": "nursery_only",
   "name": "Baby Slothicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -6838,6 +6857,7 @@
  },
  {
   "id": "baby_unicorn_black",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Black)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6848,6 +6868,7 @@
  },
  {
   "id": "baby_unicorn_blue",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Blue)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6858,6 +6879,7 @@
  },
  {
   "id": "baby_unicorn_brown",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Brown)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6868,6 +6890,7 @@
  },
  {
   "id": "baby_unicorn_death",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Death)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6878,6 +6901,7 @@
  },
  {
   "id": "baby_unicorn_elf",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Elf)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6888,6 +6912,7 @@
  },
  {
   "id": "baby_unicorn_fisherman",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Fisherman)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6898,6 +6923,7 @@
  },
  {
   "id": "baby_unicorn_flowers",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Flowers)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6908,6 +6934,7 @@
  },
  {
   "id": "baby_unicorn_forest",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Forest)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6918,6 +6945,7 @@
  },
  {
   "id": "baby_unicorn_ghost",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Ghost)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6928,6 +6956,7 @@
  },
  {
   "id": "baby_unicorn_gingerbread",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Gingerbread)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6938,6 +6967,7 @@
  },
  {
   "id": "baby_unicorn_green",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Green)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6948,6 +6978,7 @@
  },
  {
   "id": "baby_unicorn_horror",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Horror)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6958,6 +6989,7 @@
  },
  {
   "id": "baby_unicorn_look_back",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Look Back)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6968,6 +7000,7 @@
  },
  {
   "id": "baby_unicorn_orange",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Orange)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6978,6 +7011,7 @@
  },
  {
   "id": "baby_unicorn_pink",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Pink)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6988,6 +7022,7 @@
  },
  {
   "id": "baby_unicorn_pirate",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Pirate)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -6998,6 +7033,7 @@
  },
  {
   "id": "baby_unicorn_present",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Present)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7008,6 +7044,7 @@
  },
  {
   "id": "baby_unicorn_purple",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Purple)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7018,6 +7055,7 @@
  },
  {
   "id": "baby_unicorn_rainbow",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Rainbow)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7028,6 +7066,7 @@
  },
  {
   "id": "baby_unicorn_red",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Red)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7038,6 +7077,7 @@
  },
  {
   "id": "baby_unicorn_safari",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Safari)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7048,6 +7088,7 @@
  },
  {
   "id": "baby_unicorn_sparkles",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Sparkles)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7058,6 +7099,7 @@
  },
  {
   "id": "baby_unicorn_white",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (White)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7068,6 +7110,7 @@
  },
  {
   "id": "baby_unicorn_yellow",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn (Yellow)",
   "type": "baby_unicorn",
   "description": "If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7088,6 +7131,7 @@
  },
  {
   "id": "baby_unicorn_of_incest",
+  "source_zone": "nursery_only",
   "name": "Baby Unicorn of Incest",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7298,6 +7342,7 @@
  },
  {
   "id": "conjoined_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Conjoined Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7348,6 +7393,7 @@
  },
  {
   "id": "demonic_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Demonic Baby Unicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -7358,6 +7404,7 @@
  },
  {
   "id": "dingocorn",
+  "source_zone": "nursery_only",
   "name": "Dingocorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt Secнаd Editiна: When this crd enters тыr Stble, ты можешь верни ll Bby Unicorn crds в ech plyer's Stble в Детская. C&C Prвt: When this crd enters тыr Stble, ты можешь верни ll Bby Unicorn crds в ech plyer's Stble в Детская.",
@@ -7488,6 +7535,7 @@
  },
  {
   "id": "faceless_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Faceless Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7538,6 +7586,7 @@
  },
  {
   "id": "fucking_cute_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Fucking Cute Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7548,6 +7597,7 @@
  },
  {
   "id": "fucking_ugly_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Fucking Ugly Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7728,6 +7778,7 @@
  },
  {
   "id": "million_dollar_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Million Dollar Baby Unicorn",
   "type": "baby_unicorn",
   "description": "C&C Prвt",
@@ -7808,6 +7859,7 @@
  },
  {
   "id": "pageant_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Pageant Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",
@@ -7957,6 +8009,7 @@
  },
  {
   "id": "someone_else_s_baby_unicorn",
+  "source_zone": "nursery_only",
   "name": "Someone Else's Baby Unicorn",
   "type": "baby_unicorn",
   "description": "NSFW Bse: If this crd would be пожертвуйd, уничтожьed, or верниed в тыr hи, верни it в Детская вместо.",

@@ -1,28 +1,16 @@
 import mongoose, { Schema, InferSchemaType } from 'mongoose';
 
-// New DSL enums (minimal validation in schema to remain flexible)
-const TRIGGERS = [
-  'immediate',
-  'on_play',
-  'on_discard',
-  'on_destroy',
-  'on_turn_start',
-  'on_turn_end',
-  'while_in_stable',
-  'when_other_plays',
-  'after_resolve',
-  'on_enter_stable',
-  'on_sacrifice',
-  // Custom importer triggers
-  'when_other_unicorn_would_be_sacrificed_or_returned',
-  'when_other_brings_baby_from_nursery',
-] as const;
+import { TRIGGERS } from '../data/triggers';
 
+// Допустимые триггеры: каталог v2 (19) + legacy (8), см. server/src/data/triggers.ts.
 // Effects now store trigger/conditions/actions blobs with light enum checks
 const EffectSchema = new Schema(
   {
     trigger: { type: String, enum: TRIGGERS, required: true },
     conditions: { type: [Schema.Types.Mixed], default: [] },
+    // Необязательный эффект (optional в каталоге) и свободное условие (condition)
+    optional: { type: Boolean, required: false },
+    condition: { type: Schema.Types.Mixed, required: false },
     actions: { type: [Schema.Types.Mixed], required: true },
   },
   { _id: false }
@@ -48,6 +36,7 @@ const CardSchema = new Schema(
       required: true,
     },
     subtype: { type: String, default: '' },
+    mask: { type: String, required: false },
     description: { type: String, default: '' },
     image: { type: String, default: '' },
     // Admin controls

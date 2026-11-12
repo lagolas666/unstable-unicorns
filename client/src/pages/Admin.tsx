@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useState } from 'react';
-import { Container, Typography, Box, Button, TextField, Paper, Stack, MenuItem, Divider, IconButton, Switch, FormControlLabel, Dialog, DialogTitle, DialogContent, DialogActions, Pagination, InputAdornment } from '@mui/material';
+import { Container, Typography, Box, Button, TextField, Paper, Stack, MenuItem, Divider, IconButton, Switch, FormControlLabel, Dialog, DialogTitle, DialogContent, DialogActions, Pagination, InputAdornment, Alert, CircularProgress } from '@mui/material';
 import PetsIcon from '@mui/icons-material/Pets';
 import ChildCareIcon from '@mui/icons-material/ChildCare';
 import BoltIcon from '@mui/icons-material/Bolt';
@@ -9,23 +9,22 @@ import SearchIcon from '@mui/icons-material/Search';
 import UpgradeIcon from '@mui/icons-material/Upgrade';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import FlashOnIcon from '@mui/icons-material/FlashOn';
-import type { Card, CardCategory, Action, Effect, Trigger, TargetSelector } from '../../../shared/src/types';
-import { api } from '../api';
+import type { Card, CardCategory, Action, Effect, Trigger, TargetSelector, Zone, Scope } from '../../../shared/src/types';
+import { api, serverOrigin } from '../api';
 import CardTemplate from '../components/CardTemplate';
 import { AdminShell } from '../components/admin/AdminShell';
 import { CARD_TYPE_LABELS, cardTypeColor } from '../constants/cardTypeColors';
+import { KIND_BUILDERS, type BuilderFields } from '../components/EffectBuilderConfig';
 
-// Legacy effect shape used by MVP UI; server route will normalize to new DSL
-type LegacyEffect = {
-  type: 'add' | 'destroy' | 'discard' | 'return' | 'swap' | 'steal' | 'give' | 'search' | 'prevent' | 'ignore' | 'cancel';
-  trigger?: 'immediate' | 'on_play' | 'on_discard' | 'on_destroy' | 'on_turn_start' | 'on_turn_end' | 'while_in_stable' | 'when_other_plays' | 'after_resolve' | 'on_enter_stable' | 'on_sacrifice';
-  target?: 'self' | 'opponent' | 'any' | 'all' | 'from_stable' | 'all_players';
-  source?: 'hand' | 'deck' | 'discard' | 'stable' | 'any';
-  destination?: 'hand' | 'deck' | 'discard' | 'stable' | 'any';
-  card_type?: 'unicorn' | 'upgrade' | 'downgrade' | 'instant' | 'any';
-  quantity_affected?: number;
-  affects?: 'self' | 'all' | 'others'; // for discard
-  additional_data?: any;
+
+// Допустимые форматы для POST /api/upload
+const EDIT_IMAGE_MIME = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+
+// Приводит путь к изображению к абсолютному адресу сервера: /uploads/x.png -> http://host/uploads/x.png
+const resolveServerImage = (url: string) => {
+  if (!url) return '';
+  if (/^(https?:)?\/\//i.test(url) || url.startsWith('data:')) return url;
+  return `${serverOrigin}${url.startsWith('/') ? '' : '/'}${url}`;
 };
 
 export default function Admin() {
@@ -33,7 +32,6 @@ export default function Admin() {
   const [type, setType] = useState<Card['type']>('unicorn');
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageUrl, setImageUrl] = useState('');
-  const [effects, setEffects] = useState<LegacyEffect[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
   // Admin flags
   const [active, setActive] = useState<boolean>(true);
@@ -99,6 +97,7 @@ export default function Admin() {
 
   // Edit modal state
   const [editOpen, setEditOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const [editIdx, setEditIdx] = useState<number | null>(null);
   const [eName, setEName] = useState('');
   const [eType, setEType] = useState<Card['type']>('unicorn');
@@ -109,6 +108,11 @@ export default function Admin() {
   // Effects editing (advanced JSON)
   const [eEffectsJson, setEEffectsJson] = useState<string>('[]');
   const [eEffectsError, setEEffectsError] = useState<string>('');
+  // Загрузка изображения файлом в модалке редактирования (отдельно от формы создания)
+  const [eImageFile, setEImageFile] = useState<File | null>(null);
+  const [eImageUploading, setEImageUploading] = useState<boolean>(false);
+  const [eImageError, setEImageError] = useState<string>('');
+  const eImageInputRef = React.useRef<HTMLInputElement | null>(null);
 
   // Modal visual DSL editor states (independent от формы создания)
   const [meVisualMode, setMeVisualMode] = useState<boolean>(false);
@@ -127,7 +131,7 @@ export default function Admin() {
   const [meActAllowSelf, setMeActAllowSelf] = useState<boolean>(true);
   const [meActGroupFilter, setMeActGroupFilter] = useState<'any' | 'unicorn' | 'upgrade' | 'downgrade' | 'instant' | 'magic'>('any');
 
-  const meBuildSelector = (zone: 'hand' | 'deck' | 'discard' | 'stable', scope: 'self' | 'opponent' | 'any_player' | 'all_players', qty?: number): TargetSelector => ({
+  const meBuildSelector = (zone: Zone, scope: Scope, qty?: number): TargetSelector => ({
     scope,
     zone,
     ...(meActGroupFilter !== 'any' ? { filters: { card_group: meActGroupFilter as any } } : {}),
@@ -137,22 +141,30 @@ export default function Admin() {
 
   const meAddActionToCurrentGroup = () => {
     const qty = Math.max(1, Number(meActQuantity) || 1);
-    let action: Action | null = null;
-    if (meActKind === 'add') {
-      action = { kind: 'add', source: meActSrcZone, destination: meActDstZone, quantity: { mode: 'exact', value: qty }, optional: meActOptional, requires_success_of_previous: meActRequirePrev } as any;
-    } else if (meActKind === 'move' || meActKind === 'transfer' || meActKind === 'steal' || meActKind === 'give' || meActKind === 'return') {
-      action = { kind: meActKind as any, from: meBuildSelector(meActFromZone, meActScope, qty), to: { scope: 'self', zone: meActToZone }, optional: meActOptional, requires_success_of_previous: meActRequirePrev } as any;
-    } else if (meActKind === 'destroy' || meActKind === 'sacrifice' || meActKind === 'discard') {
-      const zone = meActKind === 'discard' ? 'hand' : 'stable';
-      action = { kind: meActKind as any, targets: meBuildSelector(zone, meActScope, qty), optional: meActOptional, requires_success_of_previous: meActRequirePrev } as any;
-    } else if (meActKind === 'search' || meActKind === 'reveal') {
-      action = { kind: meActKind as any, targets: meBuildSelector('deck', 'self', qty), optional: meActOptional, requires_success_of_previous: meActRequirePrev } as any;
-    } else if (meActKind === 'shuffle_deck') {
-      action = { kind: 'shuffle_deck', targets: { scope: 'self', zone: 'deck' }, optional: meActOptional, requires_success_of_previous: meActRequirePrev } as any;
-    } else if (meActKind === 'swap') {
-      action = { kind: 'swap', a: { scope: 'self', zone: 'stable', quantity: { mode: 'exact', value: 1 } } as any, b: { scope: 'opponent', zone: 'stable', quantity: { mode: 'exact', value: 1 } } as any } as any;
-    }
-    if (action) setMeCurrentGroupActions(prev => [...prev, action!]);
+    const builder = KIND_BUILDERS[meActKind];
+    if (!builder) return;
+    const fields: BuilderFields = {
+      kind: meActKind,
+      srcZone: meActSrcZone,
+      dstZone: meActDstZone,
+      fromZone: meActFromZone,
+      toZone: meActToZone,
+      scope: meActScope,
+      groupFilter: meActGroupFilter,
+      quantity: qty,
+      allowSelf: meActAllowSelf,
+      phase: "",
+      value: 0,
+      flagName: "",
+      optional: meActOptional,
+      requirePrev: meActRequirePrev,
+      cancelPriority: 0,
+      targetPlayer: "",
+      dstPlayer: "",
+      buildSelector: meBuildSelector,
+    };
+    const action = builder.build(fields);
+    if (action) setMeCurrentGroupActions(prev => [...prev, action]);
   };
 
 
@@ -227,7 +239,7 @@ export default function Admin() {
   const [searchGroup, setSearchGroup] = useState<'any' | 'unicorn' | 'upgrade' | 'downgrade' | 'instant' | 'magic'>('unicorn');
 
   // Trigger selector for newly added effects (multi-select)
-  const ALL_TRIGGERS: Exclude<LegacyEffect['trigger'], undefined>[] = [
+  const ALL_TRIGGERS: Trigger[] = [
     'immediate',
     'on_play',
     'on_enter_stable',
@@ -240,7 +252,7 @@ export default function Admin() {
     'on_sacrifice',
     'after_resolve',
   ];
-  const [selectedTriggers, setSelectedTriggers] = useState<Exclude<LegacyEffect['trigger'], undefined>[]>(['immediate']);
+  const [selectedTriggers, setSelectedTriggers] = useState<Trigger[]>(['immediate']);
   const TRIGGER_LABELS: Record<Trigger, string> = {
     immediate: 'Сразу',
     on_play: 'При розыгрыше',
@@ -255,6 +267,20 @@ export default function Admin() {
     after_resolve: 'После разрешения',
     when_other_unicorn_would_be_sacrificed_or_returned: 'Когда чужого единорога жертвуют или возвращают',
     when_other_brings_baby_from_nursery: 'Когда другой забирает детёныша из Яслей',
+    on_leave_stable: 'При выходе из стойла',
+    when_destroyed: 'Когда уничтожена',
+    on_would_be_destroyed: 'Когда должна быть уничтожена',
+    on_would_be_destroyed_or_sacrificed: 'Когда её могут уничтожить или пожертвовать',
+    on_any_unicorn_sacrificed_or_destroyed: 'Когда любого единорога жертвуют или уничтожают',
+    on_opponent_play: 'Когда соперник разыгрывает карту',
+    on_opponent_plays_neigh: 'Когда соперник играет «Нет!»',
+    on_opponent_plays_spell: 'Когда соперник разыгрывает магическую карту',
+    on_opponent_plays_unicorn: 'Когда соперник выкладывает единорога',
+    on_opponent_plays_upgrade_downgrade: 'Когда соперник играет усиливающую или ослабляющую карту',
+    on_opponent_pull_baby: 'Когда соперник забирает детёныша',
+    on_opponent_sacrifices: 'Когда соперник жертвует карту',
+    on_opponent_unicorn_effect: 'Когда срабатывает эффект единорога соперника',
+    on_opponent_would_draw: 'Когда соперник должен взять карту',
   };
   // Русские метки для визуального редактора
   const ACTION_LABELS: Record<Action['kind'], string> = {
@@ -282,6 +308,31 @@ export default function Admin() {
     limit_actions: 'Ограничить действия',
     modify_win_condition: 'Изменить условие победы',
     set_flag: 'Установить флаг',
+    // Действия каталога (v2)
+    choice: 'Выбор варианта',
+    choose_card_type: 'Выбрать тип карты',
+    choose_players: 'Выбрать игроков',
+    conditional_loop: 'Цикл с условием',
+    copy_effects: 'Скопировать эффекты',
+    draw: 'Взять карту',
+    draw_conditional: 'Взять карту при условии',
+    draw_until_limit: 'Добирать до лимита',
+    force_discard: 'Заставить сбросить',
+    force_play: 'Заставить разыграть',
+    mega_shuffle: 'Перемешать всё в колоду',
+    mill_until: 'Сбрасывать из колоды до условия',
+    modify_action: 'Изменить действие',
+    modify_hand_limit: 'Изменить лимит руки',
+    pass_hands: 'Передать руку',
+    peek: 'Посмотреть карты',
+    pull: 'Забрать из Яслей',
+    reactive_trigger: 'Ответная реакция',
+    redirect_target: 'Перенаправить цель',
+    restrict_action: 'Запретить действие',
+    return_to_hand: 'Вернуть в руку',
+    scry: 'Просмотр верхних карт',
+    skip_turn: 'Пропустить ход',
+    goto_end_turn: 'Завершить ход',
   } as const;
 
   const ZONE_LABELS: Record<'hand' | 'deck' | 'discard' | 'stable' | 'field' | 'nursery' | 'any', string> = {
@@ -312,7 +363,7 @@ export default function Admin() {
   } as const;
 
   // Build a TargetSelector from current inputs
-  const buildSelector = (zone: 'hand' | 'deck' | 'discard' | 'stable', scope: 'self' | 'opponent' | 'any_player' | 'all_players', qty?: number): TargetSelector => ({
+  const buildSelector = (zone: Zone, scope: Scope, qty?: number): TargetSelector => ({
     scope,
     zone,
     ...(actGroupFilter !== 'any' ? { filters: { card_group: actGroupFilter as any } } : {}),
@@ -323,41 +374,30 @@ export default function Admin() {
   // Add an action row into currentGroupActions based on actKind and inputs
   const addActionToCurrentGroup = () => {
     const qty = Math.max(1, Number(actQuantity) || 1);
-    let action: Action | null = null;
-    if (actKind === 'add') {
-      action = {
-        kind: 'add',
-        source: actSrcZone,
-        destination: actDstZone,
-        quantity: { mode: 'exact', value: qty },
-        optional: actOptional,
-        requires_success_of_previous: actRequirePrev,
-      } as Action;
-    } else if (actKind === 'move' || actKind === 'transfer' || actKind === 'steal' || actKind === 'give' || actKind === 'return') {
-      action = {
-        from: buildSelector(actFromZone, actScope, qty),
-        to: { scope: 'self', zone: actToZone },
-      } as Action;
-    } else if (actKind === 'destroy' || actKind === 'sacrifice' || actKind === 'discard') {
-      // zone defaults: destroy/sacrifice -> stable, discard -> hand
-      const zone = actKind === 'discard' ? 'hand' : 'stable';
-      action = {
-        targets: buildSelector(zone, actScope, qty),
-      } as Action;
-    } else if (actKind === 'search' || actKind === 'reveal') {
-      action = {
-      } as Action;
-    } else if (actKind === 'shuffle_deck') {
-      action = {
-      } as Action;
-    } else if (actKind === 'swap') {
-      const filters = actGroupFilter !== 'any' ? { card_group: actGroupFilter as any } : undefined;
-      action = {
-        a: { scope: 'self', zone: 'stable', ...(filters ? { filters } : {}), quantity: { mode: 'exact', value: 1 } } as any,
-        b: { scope: 'opponent', zone: 'stable', ...(filters ? { filters } : {}), quantity: { mode: 'exact', value: 1 } } as any,
-      } as any;
-    }
-    if (action) setCurrentGroupActions(prev => [...prev, action!]);
+    const builder = KIND_BUILDERS[actKind];
+    if (!builder) return;
+    const fields: BuilderFields = {
+      kind: actKind,
+      srcZone: actSrcZone,
+      dstZone: actDstZone,
+      fromZone: actFromZone,
+      toZone: actToZone,
+      scope: actScope,
+      groupFilter: actGroupFilter,
+      quantity: qty,
+      allowSelf: actAllowSelf,
+      phase: "",
+      value: 0,
+      flagName: "",
+      optional: actOptional,
+      requirePrev: actRequirePrev,
+      cancelPriority: 0,
+      targetPlayer: "",
+      dstPlayer: "",
+      buildSelector: buildSelector,
+    };
+    const action = builder.build(fields);
+    if (action) setCurrentGroupActions(prev => [...prev, action]);
   };
 
   const resetCurrentGroup = () => {
@@ -450,176 +490,6 @@ export default function Admin() {
     magic: 'карту типа **Магия**',
   };
 
-  function effectToText(e: LegacyEffect): string {
-    const prefixByTrigger: Record<string, string> = {
-      immediate: '',
-      on_play: '**При розыгрыше**: ',
-      on_enter_stable: '**При входе в стойло**: ',
-      on_turn_start: '**В начале хода**: ',
-      on_turn_end: '**В конце хода**: ',
-      while_in_stable: '**Пока в стойле**: ',
-      when_other_plays: '**Когда другой игрок разыгрывает карту**: ',
-      on_discard: '**При сбросе**: ',
-      on_destroy: '**При уничтожении**: ',
-      on_sacrifice: '**При пожертвовании**: ',
-      after_resolve: '**После разрешения**: ',
-      when_other_unicorn_would_be_sacrificed_or_returned: '**Когда единорога другого игрока жертвуют или возвращают в руку**: ',
-      when_other_brings_baby_from_nursery: '**Когда другой игрок забирает детёныша единорога из Яслей**: ',
-    };
-    if (e.type === 'add' && e.source === 'deck' && e.destination === 'hand') {
-      const n = e.quantity_affected || 1;
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Возьмите** ${n} карт${n > 1 ? 'ы' : 'у'} из колоды в **руку**.`;
-    }
-    if (e.type === 'destroy') {
-      const who = e.target === 'self' ? 'у себя' : e.target === 'opponent' ? 'у соперника' : 'у любого игрока';
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      const n = e.quantity_affected || 1;
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Уничтожьте** ${n} ${what}${n > 1 ? 'ы' : ''} ${who} в **стойле**.`;
-    }
-    if (e.type === 'discard') {
-      const n = e.quantity_affected || 1;
-      let who = 'вашей';
-      if (e.affects === 'all') who = 'рук всех игроков';
-      if (e.affects === 'others') who = 'рук всех других игроков';
-      const base = e.affects && e.affects !== 'self' ? `**Сбросьте** ${n} карт${n > 1 ? 'ы' : 'у'} из ${who}.` : `**Сбросьте** ${n} карт${n > 1 ? 'ы' : 'у'} из вашей **руки**.`;
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}${base}`;
-    }
-    if (e.type === 'return') {
-      const n = e.quantity_affected || 1;
-      const who = e.target === 'opponent' ? 'у соперника' : e.target === 'self' ? 'у себя' : 'в любом стойле';
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      const dest = e.destination === 'deck' ? 'в колоду' : 'в руку';
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Верните** ${n} ${what}${n > 1 ? 'ы' : ''} ${who} **${dest}**.`;
-    }
-    if (e.type === 'steal') {
-      const n = e.quantity_affected || 1;
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Украдите** ${n} ${what}${n > 1 ? 'ы' : ''} из **стойла соперника** в своё **стойло**.`;
-    }
-    if (e.type === 'give') {
-      const n = e.quantity_affected || 1;
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Передайте** ${n} ${what}${n > 1 ? 'ы' : ''} из вашего **стойла** сопернику.`;
-    }
-    if (e.type === 'swap') {
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Обменяйтесь** 1 ${what} между **стойлом соперника** и вашим.`;
-    }
-    if (e.type === 'search') {
-      const n = e.quantity_affected || 1;
-      const what = e.card_type && e.card_type !== 'any' ? GROUP_LABELS_RU[e.card_type] : '**карту**';
-      return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**Найдите** ${n} ${what}${n > 1 ? 'ы' : ''} в **колоде**.`;
-    }
-    return `${prefixByTrigger[e.trigger || 'immediate'] || ''}**${e.type}**`;
-  }
-
-  // Client-side legacy->DSL normalization for createCard
-  function legacyToDslEffects(legacy: LegacyEffect[]): Effect[] {
-    const out: Effect[] = [];
-    for (const e of legacy) {
-      const trigger = (e.trigger as Trigger) || 'immediate';
-      if (e.type === 'add') {
-        const qty = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : undefined;
-        const src = (e.source || 'deck') as any;
-        const dst = (e.destination || 'hand') as any;
-        if (src === 'deck' && dst === 'hand') {
-          out.push({ trigger, actions: [{ kind: 'add', source: src, destination: dst, quantity: qty } as any] });
-        } else {
-          const filters: any = {};
-          if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-          out.push({
-            trigger,
-            actions: [
-              {
-                kind: 'move',
-                from: { scope: 'self', zone: src, filters: Object.keys(filters).length ? filters : undefined, quantity: qty },
-                to: { scope: 'self', zone: dst },
-              } as any,
-            ],
-          });
-        }
-        continue;
-      }
-      if (e.type === 'destroy') {
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : undefined;
-        if (e.target === 'self') {
-          out.push({ trigger, actions: [{ kind: 'sacrifice', targets: { scope: 'self', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity } as any }] });
-        } else {
-          out.push({
-            trigger,
-            actions: [
-              {
-                kind: 'destroy',
-                targets: {
-                  scope: e.target === 'opponent' ? 'opponent' : 'any_player',
-                  zone: 'stable',
-                  filters: Object.keys(filters).length ? filters : undefined,
-                  ...(e.target !== 'opponent' ? { allow_self: false } : {}),
-                  quantity,
-                },
-              } as any,
-            ],
-          });
-        }
-        continue;
-      }
-      if (e.type === 'discard') {
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : { mode: 'exact', value: 1 };
-        const affects = (e.affects as 'self' | 'all' | 'others') || 'self';
-        const scope = affects === 'all' ? 'all_players' : affects === 'others' ? 'all_players' : 'self';
-        const allow_self = affects === 'others' ? false : true;
-        out.push({ trigger, actions: [{ kind: 'move', from: { scope, zone: 'hand', quantity, ...(scope !== 'self' ? { allow_self } : {}) } as any, to: { scope: 'self', zone: 'discard' } as any }] });
-        continue;
-      }
-      if (e.type === 'return') {
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : { mode: 'exact', value: 1 };
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        out.push({
-          trigger,
-          actions: [
-            {
-              kind: 'move',
-              from: { scope: e.target === 'opponent' ? 'opponent' : e.target === 'self' ? 'self' : 'any_player', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity } as any,
-              to: { scope: 'self', zone: e.destination === 'deck' ? 'deck' : 'hand' } as any,
-            } as any,
-          ],
-        });
-        continue;
-      }
-      if (e.type === 'steal') {
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : { mode: 'exact', value: 1 };
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        out.push({ trigger, actions: [{ kind: 'transfer', from: { scope: 'opponent', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity } as any, to: { scope: 'self', zone: 'stable' } as any }] });
-        continue;
-      }
-      if (e.type === 'give') {
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : { mode: 'exact', value: 1 };
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        out.push({ trigger, actions: [{ kind: 'transfer', from: { scope: 'self', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity } as any, to: { scope: 'opponent', zone: 'stable' } as any }] });
-        continue;
-      }
-      if (e.type === 'swap') {
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        out.push({ trigger, actions: [{ kind: 'swap', a: { scope: 'self', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity: { mode: 'exact', value: 1 } } as any, b: { scope: 'opponent', zone: 'stable', filters: Object.keys(filters).length ? filters : undefined, quantity: { mode: 'exact', value: 1 } } as any }] });
-        continue;
-      }
-      if (e.type === 'search') {
-        const quantity = e.quantity_affected ? { mode: 'exact', value: e.quantity_affected } : { mode: 'exact', value: 1 };
-        const filters: any = {};
-        if (e.card_type && e.card_type !== 'any') filters.card_group = e.card_type;
-        out.push({ trigger, actions: [{ kind: 'search', targets: { scope: 'self', zone: 'deck', filters: Object.keys(filters).length ? filters : undefined, quantity } as any }] });
-        continue;
-      }
-      // fallback: ignore unknown
-    }
-    return out;
-  }
 
   // Human-readable text for new DSL effects
   function dslEffectToText(ef: Effect): string {
@@ -637,6 +507,20 @@ export default function Admin() {
       after_resolve: '**После разрешения**: ',
       when_other_unicorn_would_be_sacrificed_or_returned: '**Когда единорога другого игрока жертвуют или возвращают в руку**: ',
       when_other_brings_baby_from_nursery: '**Когда другой игрок забирает детёныша единорога из Яслей**: ',
+      on_leave_stable: '**При выходе из стойла**: ',
+      when_destroyed: '**Когда уничтожена**: ',
+      on_would_be_destroyed: '**Когда её могут уничтожить**: ',
+      on_would_be_destroyed_or_sacrificed: '**Когда её могут уничтожить или пожертвовать**: ',
+      on_any_unicorn_sacrificed_or_destroyed: '**Когда любого единорога жертвуют или уничтожают**: ',
+      on_opponent_play: '**Когда соперник разыгрывает карту**: ',
+      on_opponent_plays_neigh: '**Когда соперник играет «Нет!»**: ',
+      on_opponent_plays_spell: '**Когда соперник разыгрывает магическую карту**: ',
+      on_opponent_plays_unicorn: '**Когда соперник выкладывает единорога**: ',
+      on_opponent_plays_upgrade_downgrade: '**Когда соперник играет усиливающую или ослабляющую карту**: ',
+      on_opponent_pull_baby: '**Когда соперник забирает детёныша**: ',
+      on_opponent_sacrifices: '**Когда соперник жертвует карту**: ',
+      on_opponent_unicorn_effect: '**Когда срабатывает эффект единорога соперника**: ',
+      on_opponent_would_draw: '**Когда соперник должен взять карту**: ',
     };
     const parts = ef.actions.map((a, idx) => {
       const then = idx > 0 ? 'затем ' : '';
@@ -719,57 +603,142 @@ export default function Admin() {
     setImageUrl(res.data.url);
   };
 
+  // Загрузка файла в модалке редактирования. Контракт тот же, что у handleUpload:
+  // POST /api/upload (multipart, поле image) -> { filename, url: '/uploads/<file>' }
+  const uploadEditImage = async (file: File) => {
+    if (!EDIT_IMAGE_MIME.includes(file.type)) {
+      setEImageError('Допустимые форматы: PNG, JPEG, WebP, GIF');
+      return;
+    }
+    setEImageUploading(true);
+    setEImageError('');
+    try {
+      const formData = new FormData();
+      formData.append('image', file);
+      const res = await api.post<{ url: string }>('/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setEImageFile(file);
+      setEImageUrl(res.data.url);
+    } catch {
+      setEImageError('Не удалось загрузить файл');
+    } finally {
+      setEImageUploading(false);
+    }
+  };
+
+  // Добавляет DSL-эффект (триггер + одно действие) в визуальный редактор
+  const addDslEffect = (trigger: Trigger, action: Action) => {
+    setDslEffects(prev => [...prev, { trigger, actions: [action] }]);
+  };
+  // scope из выпадающего списка формы → Scope DSL ('any' → 'any_player')
+  const stableScope = (s: string): Scope => (s === 'self' || s === 'opponent' ? (s as Scope) : 'any_player');
+  // Селектор стойла: количество + фильтр группы карт
+  const stableSel = (scope: Scope, qty: number, group: string, allowSelf: boolean): TargetSelector => ({
+    scope,
+    zone: 'stable',
+    ...(allowSelf ? { allow_self: true } : {}),
+    quantity: { mode: 'exact', value: qty },
+    ...(group !== 'any' ? { filters: { card_group: group } as any } : {}),
+  });
+
   const addDrawEffect = () => {
     const qty = Math.max(1, Number(drawQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'add', source: 'deck', destination: 'hand', quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, { kind: 'add', source: 'deck', destination: 'hand', quantity: { mode: 'exact', value: qty } });
+    }
   };
 
   const addDestroyStableEffect = () => {
     const qty = Math.max(1, Number(destroyQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'destroy', target: destroyScope === 'opponent' ? 'opponent' : 'any', card_type: destroyCardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, { kind: 'destroy', targets: stableSel(stableScope(destroyScope), qty, destroyCardGroup, destroyScope !== 'self' && destroyScope !== 'opponent') });
+    }
   };
 
   const addDiscardEffect = () => {
     const qty = Math.max(1, Number(discardQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'discard', quantity_affected: qty, affects: discardAffects, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    const affects = String(discardAffects);
+    const scope: Scope = affects === 'self' ? 'self' : 'all_players';
+    for (const t of selectedTriggers) {
+      addDslEffect(t, {
+        kind: 'discard',
+        targets: {
+          scope,
+          zone: 'hand',
+          ...(scope === 'all_players' ? { allow_self: affects !== 'others' } : {}),
+          quantity: { mode: 'exact', value: qty },
+        },
+      });
+    }
   };
 
   const addReturnEffect = () => {
     const qty = Math.max(1, Number(returnQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'return', target: returnScope === 'self' ? 'self' : returnScope === 'opponent' ? 'opponent' : 'any', destination: returnDest, card_type: returnCardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, {
+        kind: 'return',
+        from: stableSel(stableScope(returnScope), qty, returnCardGroup, returnScope !== 'self' && returnScope !== 'opponent'),
+        to: { scope: 'self', zone: returnDest as Zone },
+      });
+    }
   };
 
   const addStealEffect = () => {
     const qty = Math.max(1, Number(transferQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'steal', card_type: transferCardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, { kind: 'steal', from: stableSel('opponent', qty, transferCardGroup, false), to: { scope: 'self', zone: 'stable' } });
+    }
   };
 
   const addGiveEffect = () => {
     const qty = Math.max(1, Number(transferQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'give', card_type: transferCardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, { kind: 'give', from: stableSel('self', qty, transferCardGroup, false), to: { scope: 'opponent', zone: 'stable' } });
+    }
   };
 
   const addSwapEffect = () => {
-    const toAdd = selectedTriggers.map(t => ({ type: 'swap', card_type: swapCardGroup, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, {
+        kind: 'swap',
+        a: stableSel('opponent', 1, swapCardGroup, false),
+        b: stableSel('self', 1, 'any', false),
+      });
+    }
   };
 
   const addFromDiscardEffect = () => {
     const qty = Math.max(1, Number(fromDiscardQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'add', source: 'discard', destination: 'hand', card_type: fromDiscardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, {
+        kind: 'add',
+        source: 'discard',
+        destination: 'hand',
+        targets: {
+          scope: 'self',
+          zone: 'discard',
+          quantity: { mode: 'exact', value: qty },
+          ...(fromDiscardGroup !== 'any' ? { filters: { card_group: fromDiscardGroup } as any } : {}),
+        },
+      });
+    }
   };
 
   const addSearchDeckEffect = () => {
     const qty = Math.max(1, Number(searchQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'search', card_type: searchGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, {
+        kind: 'search',
+        targets: {
+          scope: 'self',
+          zone: 'deck',
+          quantity: { mode: 'exact', value: qty },
+          ...(searchGroup !== 'any' ? { filters: { card_group: searchGroup } as any } : {}),
+        },
+        place: 'hand',
+      });
+    }
   };
 
   // Sacrifice (destroy own stable card) builder
@@ -777,8 +746,9 @@ export default function Admin() {
   const [sacrificeCardGroup, setSacrificeCardGroup] = useState<'any' | 'unicorn' | 'upgrade' | 'downgrade' | 'instant' | 'non_unicorn'>('any');
   const addSacrificeEffect = () => {
     const qty = Math.max(1, Number(sacrificeQty) || 1);
-    const toAdd = selectedTriggers.map(t => ({ type: 'destroy', target: 'self', card_type: sacrificeCardGroup, quantity_affected: qty, trigger: t } as LegacyEffect));
-    setEffects(prev => [...prev, ...toAdd]);
+    for (const t of selectedTriggers) {
+      addDslEffect(t, { kind: 'sacrifice', targets: stableSel('self', qty, sacrificeCardGroup, false) });
+    }
   };
 
   const createCard = async () => {
@@ -824,7 +794,7 @@ export default function Admin() {
       type,
       image: imageUrl,
       description: description,
-      effects: (visualMode ? dslEffects : [...legacyToDslEffects(effects), ...dslEffects]) as any,
+      effects: (visualMode ? dslEffects : []) as any,
       active,
       deck_count: Math.max(0, Number(deckCount) || 0),
       ...(costs.length > 0
@@ -842,7 +812,6 @@ export default function Admin() {
     setType('unicorn');
     setImageFile(null);
     setImageUrl('');
-    setEffects([]);
     setDslEffects([]);
     // reset play requirements
     setCostSacrificeEnabled(false);
@@ -859,74 +828,177 @@ export default function Admin() {
         <Typography variant="subtitle2" color="text.secondary" gutterBottom>
           Конструктор карт
         </Typography>
-      <Paper sx={{ p: 2, mb: 3 }}>
-        <Stack spacing={2}>
-          <Stack direction="row" spacing={2} alignItems="center">
-            <TextField
-              label="Ссылка на Wiki"
-              value={wikiUrl}
-              onChange={e => setWikiUrl(e.target.value)}
-              fullWidth
-            />
-            <Button variant="contained" disabled={wikiLoading || !wikiUrl.trim()} onClick={handleImportFromWiki}>
-              {wikiLoading ? 'Импорт...' : 'Импорт из Wiki'}
-            </Button>
-          </Stack>
-          {!!wikiError && (
-            <Typography color="error" variant="body2">{wikiError}</Typography>
-          )}
-          <TextField label="Название" value={name} onChange={e => setName(e.target.value)} />
-          <TextField select label="Тип" value={type} onChange={e => setType(e.target.value as CardCategory)}>
-            {(
-              [
-                'baby_unicorn',
-                'basic_unicorn',
-                'magical_unicorn',
-                'ultimate_unicorn',
-                'magic',
-                'instant',
-                'upgrade',
-                'downgrade',
-                'unicorn',
-                'non_unicorn',
-              ] as CardCategory[]
-            ).map(opt => (
-              <MenuItem key={opt} value={opt}>
-                {CARD_TYPE_LABELS[opt]}
-              </MenuItem>
-            ))}
-          </TextField>
+      <Stack direction="row" spacing={2} sx={{ mb: 2 }}>
+        <Button variant="contained" onClick={() => setCreateOpen(true)}>Создать карту</Button>
+      </Stack>
 
-          <Box>
-            <input type="file" accept="image/*" onChange={e => setImageFile(e.target.files?.[0] || null)} />
-            <Button onClick={handleUpload} disabled={!imageFile} sx={{ ml: 2 }} variant="outlined">
-              Загрузить изображение
-            </Button>
-            {imageUrl && (
-              <Box mt={1}>
-                <img src={imageUrl.startsWith('http') ? imageUrl : `${new URL((api.defaults.baseURL as string) || '/', window.location.href).origin}${imageUrl}`} alt="preview" style={{ maxHeight: 120 }} />
-              </Box>
+      {/* Модальное окно создания карты */}
+      <Dialog open={createOpen} onClose={() => setCreateOpen(false)} fullWidth maxWidth="md">
+        <DialogTitle>Создать карту</DialogTitle>
+        <DialogContent dividers>
+        <Paper sx={{ p: 2, mb: 3 }}>
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={2} alignItems="center">
+              <TextField
+                label="Ссылка на Wiki"
+                value={wikiUrl}
+                onChange={e => setWikiUrl(e.target.value)}
+                fullWidth
+              />
+              <Button variant="contained" disabled={wikiLoading || !wikiUrl.trim()} onClick={handleImportFromWiki}>
+                {wikiLoading ? 'Импорт...' : 'Импорт из Wiki'}
+              </Button>
+            </Stack>
+            {!!wikiError && (
+              <Typography color="error" variant="body2">{wikiError}</Typography>
             )}
-          </Box>
+            <TextField label="Название" value={name} onChange={e => setName(e.target.value)} />
+            <TextField select label="Тип" value={type} onChange={e => setType(e.target.value as CardCategory)}>
+              {(
+                [
+                  'baby_unicorn',
+                  'basic_unicorn',
+                  'magical_unicorn',
+                  'ultimate_unicorn',
+                  'magic',
+                  'instant',
+                  'upgrade',
+                  'downgrade',
+                  'unicorn',
+                  'non_unicorn',
+                ] as CardCategory[]
+              ).map(opt => (
+                <MenuItem key={opt} value={opt}>
+                  {CARD_TYPE_LABELS[opt]}
+                </MenuItem>
+              ))}
+            </TextField>
 
-          <Divider textAlign="left">Требования к розыгрышу</Divider>
-          <Stack spacing={1}>
+            <Box>
+              <input type="file" accept="image/*" onChange={e => setImageFile(e.target.files?.[0] || null)} />
+              <Button onClick={handleUpload} disabled={!imageFile} sx={{ ml: 2 }} variant="outlined">
+                Загрузить изображение
+              </Button>
+              {imageUrl && (
+                <Box mt={1}>
+                  <img src={imageUrl.startsWith('http') ? imageUrl : `${new URL((api.defaults.baseURL as string) || '/', window.location.href).origin}${imageUrl}`} alt="preview" style={{ maxHeight: 120 }} />
+                </Box>
+              )}
+            </Box>
+
+            <Divider textAlign="left">Требования к розыгрышу</Divider>
+            <Stack spacing={1}>
+              <FormControlLabel
+                control={<Switch checked={costSacrificeEnabled} onChange={(_, v) => setCostSacrificeEnabled(v)} />}
+                label="Стоимость: пожертвовать из своего стойла"
+              />
+              {costSacrificeEnabled && (
+                <Stack spacing={1}>
+                  {sacrificeCosts.map((c, idx) => (
+                    <Stack key={idx} direction="row" spacing={2} alignItems="center">
+                      <TextField
+                        select
+                        label="Тип карты"
+                        size="small"
+                        value={c.group}
+                        onChange={e => {
+                          const v = e.target.value as SacrificeCost['group'];
+                          setSacrificeCosts(prev => prev.map((it, i) => (i === idx ? { ...it, group: v } : it)));
+                        }}
+                        sx={{ minWidth: 180 }}
+                      >
+                        <MenuItem value="any">Любая</MenuItem>
+                        <MenuItem value="unicorn">Единорог</MenuItem>
+                        <MenuItem value="upgrade">Улучшение</MenuItem>
+                        <MenuItem value="downgrade">Ухудшение</MenuItem>
+                        <MenuItem value="instant">Мгновенная</MenuItem>
+                        <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+                      </TextField>
+                      <TextField
+                        type="number"
+                        label="Кол-во"
+                        size="small"
+                        value={c.qty}
+                        onChange={e => {
+                          const v = Number(e.target.value);
+                          setSacrificeCosts(prev => prev.map((it, i) => (i === idx ? { ...it, qty: v } : it)));
+                        }}
+                        inputProps={{ min: 1 }}
+                        sx={{ width: 120 }}
+                      />
+                      <Button color="error" onClick={() => setSacrificeCosts(prev => prev.filter((_, i) => i !== idx))}>Удалить</Button>
+                    </Stack>
+                  ))}
+
+                  <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+                    <Typography variant="subtitle2">Взять из сброса</Typography>
+                    <TextField select label="Тип карты" size="small" value={fromDiscardGroup} onChange={e => setFromDiscardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
+                      <MenuItem value="any">Любая</MenuItem>
+                      <MenuItem value="unicorn">Единорог</MenuItem>
+                      <MenuItem value="upgrade">Улучшение</MenuItem>
+                      <MenuItem value="downgrade">Ухудшение</MenuItem>
+                      <MenuItem value="instant">Мгновенная</MenuItem>
+                      <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+                    </TextField>
+                    <TextField
+                      type="number"
+                      label="Кол-во"
+                      size="small"
+                      value={fromDiscardQty}
+                      onChange={e => setFromDiscardQty(Number(e.target.value))}
+                      inputProps={{ min: 1 }}
+                      sx={{ width: 120 }}
+                    />
+                    <Button variant="outlined" onClick={addFromDiscardEffect}>+ Добавить «из сброса»</Button>
+                  </Stack>
+
+                  <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+                    <Typography variant="subtitle2">Поиск в колоде</Typography>
+                    <TextField select label="Тип карты" size="small" value={searchGroup} onChange={e => setSearchGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
+                      <MenuItem value="any">Любая</MenuItem>
+                      <MenuItem value="unicorn">Единорог</MenuItem>
+                      <MenuItem value="upgrade">Улучшение</MenuItem>
+                      <MenuItem value="downgrade">Ухудшение</MenuItem>
+                      <MenuItem value="instant">Мгновенная</MenuItem>
+                      <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+                    </TextField>
+                    <TextField
+                      type="number"
+                      label="Кол-во"
+                      size="small"
+                      value={searchQty}
+                      onChange={e => setSearchQty(Number(e.target.value))}
+                      inputProps={{ min: 1 }}
+                      sx={{ width: 120 }}
+                    />
+                    <Button variant="outlined" onClick={addSearchDeckEffect}>+ Добавить «поиск в колоде»</Button>
+                  </Stack>
+                  <Stack direction="row" spacing={1}>
+                    <Button variant="outlined" onClick={() => setSacrificeCosts(prev => [...prev, { qty: 1, group: 'any' }])}>+ Добавить требование</Button>
+                    {sacrificeCosts.length === 0 && (
+                      <Button onClick={() => setSacrificeCosts([{ qty: 1, group: 'any' }])}>Добавить первое</Button>
+                    )}
+                  </Stack>
+                </Stack>
+              )}
+            </Stack>
+
             <FormControlLabel
-              control={<Switch checked={costSacrificeEnabled} onChange={(_, v) => setCostSacrificeEnabled(v)} />}
-              label="Стоимость: пожертвовать из своего стойла"
+              control={<Switch checked={costDiscardEnabled} onChange={(_, v) => setCostDiscardEnabled(v)} />}
+              label="Стоимость: сбросить из своей руки"
             />
-            {costSacrificeEnabled && (
+            {costDiscardEnabled && (
               <Stack spacing={1}>
-                {sacrificeCosts.map((c, idx) => (
-                  <Stack key={idx} direction="row" spacing={2} alignItems="center">
+                {discardCostsReq.map((c, idx) => (
+                  <Stack key={`dc-${idx}`} direction="row" spacing={2} alignItems="center">
                     <TextField
                       select
                       label="Тип карты"
                       size="small"
                       value={c.group}
                       onChange={e => {
-                        const v = e.target.value as SacrificeCost['group'];
-                        setSacrificeCosts(prev => prev.map((it, i) => (i === idx ? { ...it, group: v } : it)));
+                        const v = e.target.value as DiscardCost['group'];
+                        setDiscardCostsReq(prev => prev.map((it, i) => (i === idx ? { ...it, group: v } : it)));
                       }}
                       sx={{ minWidth: 180 }}
                     >
@@ -944,446 +1016,346 @@ export default function Admin() {
                       value={c.qty}
                       onChange={e => {
                         const v = Number(e.target.value);
-                        setSacrificeCosts(prev => prev.map((it, i) => (i === idx ? { ...it, qty: v } : it)));
+                        setDiscardCostsReq(prev => prev.map((it, i) => (i === idx ? { ...it, qty: v } : it)));
                       }}
                       inputProps={{ min: 1 }}
                       sx={{ width: 120 }}
                     />
-                    <Button color="error" onClick={() => setSacrificeCosts(prev => prev.filter((_, i) => i !== idx))}>Удалить</Button>
+                    <Button color="error" onClick={() => setDiscardCostsReq(prev => prev.filter((_, i) => i !== idx))}>Удалить</Button>
                   </Stack>
                 ))}
 
-                <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-                  <Typography variant="subtitle2">Взять из сброса</Typography>
-                  <TextField select label="Тип карты" size="small" value={fromDiscardGroup} onChange={e => setFromDiscardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
-                    <MenuItem value="any">Любая</MenuItem>
-                    <MenuItem value="unicorn">Единорог</MenuItem>
-                    <MenuItem value="upgrade">Улучшение</MenuItem>
-                    <MenuItem value="downgrade">Ухудшение</MenuItem>
-                    <MenuItem value="instant">Мгновенная</MenuItem>
-                    <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-                  </TextField>
-                  <TextField
-                    type="number"
-                    label="Кол-во"
-                    size="small"
-                    value={fromDiscardQty}
-                    onChange={e => setFromDiscardQty(Number(e.target.value))}
-                    inputProps={{ min: 1 }}
-                    sx={{ width: 120 }}
-                  />
-                  <Button variant="outlined" onClick={addFromDiscardEffect}>+ Добавить «из сброса»</Button>
-                </Stack>
-
-                <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-                  <Typography variant="subtitle2">Поиск в колоде</Typography>
-                  <TextField select label="Тип карты" size="small" value={searchGroup} onChange={e => setSearchGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
-                    <MenuItem value="any">Любая</MenuItem>
-                    <MenuItem value="unicorn">Единорог</MenuItem>
-                    <MenuItem value="upgrade">Улучшение</MenuItem>
-                    <MenuItem value="downgrade">Ухудшение</MenuItem>
-                    <MenuItem value="instant">Мгновенная</MenuItem>
-                    <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-                  </TextField>
-                  <TextField
-                    type="number"
-                    label="Кол-во"
-                    size="small"
-                    value={searchQty}
-                    onChange={e => setSearchQty(Number(e.target.value))}
-                    inputProps={{ min: 1 }}
-                    sx={{ width: 120 }}
-                  />
-                  <Button variant="outlined" onClick={addSearchDeckEffect}>+ Добавить «поиск в колоде»</Button>
-                </Stack>
                 <Stack direction="row" spacing={1}>
-                  <Button variant="outlined" onClick={() => setSacrificeCosts(prev => [...prev, { qty: 1, group: 'any' }])}>+ Добавить требование</Button>
-                  {sacrificeCosts.length === 0 && (
-                    <Button onClick={() => setSacrificeCosts([{ qty: 1, group: 'any' }])}>Добавить первое</Button>
+                  <Button variant="outlined" onClick={() => setDiscardCostsReq(prev => [...prev, { qty: 1, group: 'any' }])}>+ Добавить требование</Button>
+                  {discardCostsReq.length === 0 && (
+                    <Button onClick={() => setDiscardCostsReq([{ qty: 1, group: 'any' }])}>Добавить первое</Button>
                   )}
                 </Stack>
               </Stack>
             )}
-          </Stack>
 
-          <FormControlLabel
-            control={<Switch checked={costDiscardEnabled} onChange={(_, v) => setCostDiscardEnabled(v)} />}
-            label="Стоимость: сбросить из своей руки"
-          />
-          {costDiscardEnabled && (
-            <Stack spacing={1}>
-              {discardCostsReq.map((c, idx) => (
-                <Stack key={`dc-${idx}`} direction="row" spacing={2} alignItems="center">
-                  <TextField
-                    select
-                    label="Тип карты"
-                    size="small"
-                    value={c.group}
-                    onChange={e => {
-                      const v = e.target.value as DiscardCost['group'];
-                      setDiscardCostsReq(prev => prev.map((it, i) => (i === idx ? { ...it, group: v } : it)));
-                    }}
-                    sx={{ minWidth: 180 }}
-                  >
-                    <MenuItem value="any">Любая</MenuItem>
-                    <MenuItem value="unicorn">Единорог</MenuItem>
-                    <MenuItem value="upgrade">Улучшение</MenuItem>
-                    <MenuItem value="downgrade">Ухудшение</MenuItem>
-                    <MenuItem value="instant">Мгновенная</MenuItem>
-                    <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+            <Divider textAlign="left">Эффекты</Divider>
+            <Typography variant="body2" color="text.secondary">
+              Вы можете использовать визуальный редактор или быстрые пресеты ниже.
+            </Typography>
+            <FormControlLabel control={<Switch checked={visualMode} onChange={(_, v) => setVisualMode(v)} />} label="Визуальный редактор эффектов" />
+
+            {visualMode && (
+              <Stack spacing={2}>
+                <Stack direction="row" spacing={2} flexWrap="wrap">
+                  <TextField select label="Триггер" value={currentGroupTrigger} onChange={e => setCurrentGroupTrigger(e.target.value as Trigger)} sx={{ minWidth: 220 }}>
+                    {(['immediate','on_play','on_enter_stable','on_turn_start','on_turn_end','while_in_stable','when_other_plays','on_discard','on_destroy','on_sacrifice','after_resolve'] as Trigger[]).map(t => (
+                      <MenuItem key={t} value={t}>{TRIGGER_LABELS[t]}</MenuItem>
+                    ))}
                   </TextField>
-                  <TextField
-                    type="number"
-                    label="Кол-во"
-                    size="small"
-                    value={c.qty}
-                    onChange={e => {
-                      const v = Number(e.target.value);
-                      setDiscardCostsReq(prev => prev.map((it, i) => (i === idx ? { ...it, qty: v } : it)));
-                    }}
-                    inputProps={{ min: 1 }}
-                    sx={{ width: 120 }}
-                  />
-                  <Button color="error" onClick={() => setDiscardCostsReq(prev => prev.filter((_, i) => i !== idx))}>Удалить</Button>
                 </Stack>
-              ))}
-
-              <Stack direction="row" spacing={1}>
-                <Button variant="outlined" onClick={() => setDiscardCostsReq(prev => [...prev, { qty: 1, group: 'any' }])}>+ Добавить требование</Button>
-                {discardCostsReq.length === 0 && (
-                  <Button onClick={() => setDiscardCostsReq([{ qty: 1, group: 'any' }])}>Добавить первое</Button>
+                <Divider textAlign="left">Добавить действие</Divider>
+                <Stack direction="row" spacing={2} flexWrap="wrap">
+                  <TextField select label="Действие" value={actKind} onChange={e => setActKind(e.target.value as any)} sx={{ minWidth: 200 }}>
+                    {(['add','move','transfer','return','steal','give','discard','destroy','sacrifice','search','reveal','shuffle_deck','swap'] as Action['kind'][]).map(k => (
+                      <MenuItem key={k as string} value={k as string}>{ACTION_LABELS[k]}</MenuItem>
+                    ))}
+                  </TextField>
+                  <TextField type="number" label="Количество" value={actQuantity} onChange={e => setActQuantity(Number(e.target.value))} sx={{ width: 140 }} />
+                  <FormControlLabel control={<Switch checked={actOptional} onChange={(_, v) => setActOptional(v)} />} label="Опционально" />
+                  <FormControlLabel control={<Switch checked={actRequirePrev} onChange={(_, v) => setActRequirePrev(v)} />} label="После успеха" />
+                </Stack>
+                <Stack direction="row" spacing={2} flexWrap="wrap">
+                  <TextField select label="Источник" value={actSrcZone} onChange={e => setActSrcZone(e.target.value as any)} sx={{ width: 160 }}>
+                    {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
+                  </TextField>
+                  <TextField select label="Назначение" value={actDstZone} onChange={e => setActDstZone(e.target.value as any)} sx={{ width: 160 }}>
+                    {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
+                  </TextField>
+                  <TextField select label="Из зоны" value={actFromZone} onChange={e => setActFromZone(e.target.value as any)} sx={{ width: 160 }}>
+                    {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
+                  </TextField>
+                  <TextField select label="В зону" value={actToZone} onChange={e => setActToZone(e.target.value as any)} sx={{ width: 160 }}>
+                    {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
+                  </TextField>
+                  <TextField select label="Область" value={actScope} onChange={e => setActScope(e.target.value as any)} sx={{ width: 180 }}>
+                    {(['self','opponent','any_player','all_players'] as const).map(s => (<MenuItem key={s} value={s}>{SCOPE_LABELS[s]}</MenuItem>))}
+                  </TextField>
+                  <FormControlLabel control={<Switch checked={actAllowSelf} onChange={(_, v) => setActAllowSelf(v)} />} label="Разрешить себя" />
+                  <TextField select label="Тип карты" value={actGroupFilter} onChange={e => setActGroupFilter(e.target.value as any)} sx={{ width: 200 }}>
+                    {(['any','unicorn','upgrade','downgrade','instant','magic'] as const).map(g => (<MenuItem key={g} value={g}>{GROUP_LABELS[g]}</MenuItem>))}
+                  </TextField>
+                </Stack>
+                <Stack direction="row" spacing={1}>
+                  <Button variant="outlined" onClick={addActionToCurrentGroup}>Добавить действие в группу</Button>
+                  <Button variant="contained" onClick={() => {
+                    if (!currentGroupActions.length) return;
+                    setDslEffects(prev => [...prev, { trigger: currentGroupTrigger, actions: currentGroupActions } as any]);
+                    resetCurrentGroup();
+                  }}>Добавить группу эффектов</Button>
+                </Stack>
+                {!!currentGroupActions.length && (
+                  <Typography variant="body2" color="text.secondary">Текущая группа: {currentGroupActions.length} действий</Typography>
+                )}
+                {dslEffects.length > 0 && (
+                  <Stack spacing={1}>
+                    <Divider textAlign="left">Эффекты карты</Divider>
+                    {dslEffects.map((ef, i) => (
+                      <Paper key={i} sx={{ p: 1 }}>
+                        <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                          <Box sx={{ flex: 1 }}>
+                            <Typography variant="body2" component="div" dangerouslySetInnerHTML={{ __html: dslEffectToText(ef).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} />
+                          </Box>
+                          <Button size="small" color="error" onClick={() => setDslEffects(prev => prev.filter((_, idx) => idx !== i))}>Удалить</Button>
+                        </Stack>
+                      </Paper>
+                    ))}
+                  </Stack>
                 )}
               </Stack>
+            )}
+
+            {!visualMode && (
+            <>
+            <Divider textAlign="left">Конструктор эффектов</Divider>
+            <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
+              <Typography variant="subtitle2">Триггеры</Typography>
+              <TextField
+                select
+                size="small"
+                label="Когда срабатывает"
+                SelectProps={{ multiple: true, renderValue: (vals) => (vals as string[]).map(v => TRIGGER_LABELS[v as keyof typeof TRIGGER_LABELS]).join(', ') }}
+                value={selectedTriggers}
+                onChange={e => setSelectedTriggers(typeof e.target.value === 'string' ? (e.target.value as any).split(',') : (e.target.value as any))}
+                sx={{ minWidth: 360 }}
+              >
+                {ALL_TRIGGERS.map(t => (
+                  <MenuItem key={t} value={t}>{TRIGGER_LABELS[t]}</MenuItem>
+                ))}
+              </TextField>
+              <Button size="small" variant="outlined" onClick={() => setSelectedTriggers(ALL_TRIGGERS)}>Выбрать все</Button>
+              <Button size="small" onClick={() => setSelectedTriggers(['immediate'])}>Сбросить</Button>
             </Stack>
-          )}
-
-          <Divider textAlign="left">Эффекты</Divider>
-          <Typography variant="body2" color="text.secondary">
-            Вы можете использовать визуальный редактор или быстрые пресеты ниже.
-          </Typography>
-          <FormControlLabel control={<Switch checked={visualMode} onChange={(_, v) => setVisualMode(v)} />} label="Визуальный редактор эффектов" />
-
-          {visualMode && (
-            <Stack spacing={2}>
-              <Stack direction="row" spacing={2} flexWrap="wrap">
-                <TextField select label="Триггер" value={currentGroupTrigger} onChange={e => setCurrentGroupTrigger(e.target.value as Trigger)} sx={{ minWidth: 220 }}>
-                  {(['immediate','on_play','on_enter_stable','on_turn_start','on_turn_end','while_in_stable','when_other_plays','on_discard','on_destroy','on_sacrifice','after_resolve'] as Trigger[]).map(t => (
-                    <MenuItem key={t} value={t}>{TRIGGER_LABELS[t]}</MenuItem>
-                  ))}
-                </TextField>
-              </Stack>
-              <Divider textAlign="left">Добавить действие</Divider>
-              <Stack direction="row" spacing={2} flexWrap="wrap">
-                <TextField select label="Действие" value={actKind} onChange={e => setActKind(e.target.value as any)} sx={{ minWidth: 200 }}>
-                  {(['add','move','transfer','return','steal','give','discard','destroy','sacrifice','search','reveal','shuffle_deck','swap'] as Action['kind'][]).map(k => (
-                    <MenuItem key={k as string} value={k as string}>{ACTION_LABELS[k]}</MenuItem>
-                  ))}
-                </TextField>
-                <TextField type="number" label="Количество" value={actQuantity} onChange={e => setActQuantity(Number(e.target.value))} sx={{ width: 140 }} />
-                <FormControlLabel control={<Switch checked={actOptional} onChange={(_, v) => setActOptional(v)} />} label="Опционально" />
-                <FormControlLabel control={<Switch checked={actRequirePrev} onChange={(_, v) => setActRequirePrev(v)} />} label="После успеха" />
-              </Stack>
-              <Stack direction="row" spacing={2} flexWrap="wrap">
-                <TextField select label="Источник" value={actSrcZone} onChange={e => setActSrcZone(e.target.value as any)} sx={{ width: 160 }}>
-                  {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
-                </TextField>
-                <TextField select label="Назначение" value={actDstZone} onChange={e => setActDstZone(e.target.value as any)} sx={{ width: 160 }}>
-                  {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
-                </TextField>
-                <TextField select label="Из зоны" value={actFromZone} onChange={e => setActFromZone(e.target.value as any)} sx={{ width: 160 }}>
-                  {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
-                </TextField>
-                <TextField select label="В зону" value={actToZone} onChange={e => setActToZone(e.target.value as any)} sx={{ width: 160 }}>
-                  {(['hand','deck','discard','stable'] as const).map(z => (<MenuItem key={z} value={z}>{ZONE_LABELS[z]}</MenuItem>))}
-                </TextField>
-                <TextField select label="Область" value={actScope} onChange={e => setActScope(e.target.value as any)} sx={{ width: 180 }}>
-                  {(['self','opponent','any_player','all_players'] as const).map(s => (<MenuItem key={s} value={s}>{SCOPE_LABELS[s]}</MenuItem>))}
-                </TextField>
-                <FormControlLabel control={<Switch checked={actAllowSelf} onChange={(_, v) => setActAllowSelf(v)} />} label="Разрешить себя" />
-                <TextField select label="Тип карты" value={actGroupFilter} onChange={e => setActGroupFilter(e.target.value as any)} sx={{ width: 200 }}>
-                  {(['any','unicorn','upgrade','downgrade','instant','magic'] as const).map(g => (<MenuItem key={g} value={g}>{GROUP_LABELS[g]}</MenuItem>))}
-                </TextField>
-              </Stack>
-              <Stack direction="row" spacing={1}>
-                <Button variant="outlined" onClick={addActionToCurrentGroup}>Добавить действие в группу</Button>
-                <Button variant="contained" onClick={() => {
-                  if (!currentGroupActions.length) return;
-                  setDslEffects(prev => [...prev, { trigger: currentGroupTrigger, actions: currentGroupActions } as any]);
-                  resetCurrentGroup();
-                }}>Добавить группу эффектов</Button>
-              </Stack>
-              {!!currentGroupActions.length && (
-                <Typography variant="body2" color="text.secondary">Текущая группа: {currentGroupActions.length} действий</Typography>
-              )}
-              {dslEffects.length > 0 && (
-                <Stack spacing={1}>
-                  <Divider textAlign="left">Эффекты карты</Divider>
-                  {dslEffects.map((ef, i) => (
-                    <Paper key={i} sx={{ p: 1 }}>
-                      <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                        <Box sx={{ flex: 1 }}>
-                          <Typography variant="body2" component="div" dangerouslySetInnerHTML={{ __html: dslEffectToText(ef).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') }} />
-                        </Box>
-                        <Button size="small" color="error" onClick={() => setDslEffects(prev => prev.filter((_, idx) => idx !== i))}>Удалить</Button>
-                      </Stack>
-                    </Paper>
-                  ))}
-                </Stack>
-              )}
+            <Stack direction="row" spacing={2} alignItems="center">
+              <Typography variant="subtitle2">Добор</Typography>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={drawQty}
+                onChange={e => setDrawQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addDrawEffect}>
+                + Добавить эффект добора
+              </Button>
             </Stack>
-          )}
 
-          {!visualMode && (
-          <>
-          <Divider textAlign="left">Конструктор эффектов</Divider>
-          <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
-            <Typography variant="subtitle2">Триггеры</Typography>
-            <TextField
-              select
-              size="small"
-              label="Когда срабатывает"
-              SelectProps={{ multiple: true, renderValue: (vals) => (vals as string[]).map(v => TRIGGER_LABELS[v as keyof typeof TRIGGER_LABELS]).join(', ') }}
-              value={selectedTriggers}
-              onChange={e => setSelectedTriggers(typeof e.target.value === 'string' ? (e.target.value as any).split(',') : (e.target.value as any))}
-              sx={{ minWidth: 360 }}
-            >
-              {ALL_TRIGGERS.map(t => (
-                <MenuItem key={t} value={t}>{TRIGGER_LABELS[t]}</MenuItem>
+            <Stack direction="row" spacing={2} alignItems="center">
+              <Typography variant="subtitle2">Сброс</Typography>
+              <TextField select label="Кто сбрасывает" size="small" value={discardAffects} onChange={e => setDiscardAffects(e.target.value as any)} sx={{ minWidth: 180 }}>
+                <MenuItem value="self">Только вы</MenuItem>
+                <MenuItem value="all">Все игроки</MenuItem>
+                <MenuItem value="others">Все, кроме вас</MenuItem>
+              </TextField>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={discardQty}
+                onChange={e => setDiscardQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addDiscardEffect}>+ Добавить эффект сброса</Button>
+            </Stack>
+
+            <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+              <Typography variant="subtitle2">Возврат</Typography>
+              <TextField select label="Цель" size="small" value={returnScope} onChange={e => setReturnScope(e.target.value as any)} sx={{ minWidth: 140 }}>
+                <MenuItem value="any">Любой</MenuItem>
+                <MenuItem value="self">Себя</MenuItem>
+                <MenuItem value="opponent">Соперник</MenuItem>
+              </TextField>
+              <TextField select label="Куда" size="small" value={returnDest} onChange={e => setReturnDest(e.target.value as any)} sx={{ minWidth: 140 }}>
+                <MenuItem value="hand">В руку</MenuItem>
+                <MenuItem value="deck">В колоду</MenuItem>
+              </TextField>
+              <TextField select label="Тип карты" size="small" value={returnCardGroup} onChange={e => setReturnCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
+                <MenuItem value="any">Любой</MenuItem>
+                <MenuItem value="unicorn">Единорог</MenuItem>
+                <MenuItem value="upgrade">Улучшение</MenuItem>
+                <MenuItem value="downgrade">Ухудшение</MenuItem>
+                <MenuItem value="instant">Мгновенная</MenuItem>
+                <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+              </TextField>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={returnQty}
+                onChange={e => setReturnQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addReturnEffect}>+ Добавить эффект возврата</Button>
+            </Stack>
+
+            <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+              <Typography variant="subtitle2">Кража/Подарок</Typography>
+              <TextField select label="Тип карты" size="small" value={transferCardGroup} onChange={e => setTransferCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
+                <MenuItem value="any">Любой</MenuItem>
+                <MenuItem value="unicorn">Единорог</MenuItem>
+                <MenuItem value="upgrade">Улучшение</MenuItem>
+                <MenuItem value="downgrade">Ухудшение</MenuItem>
+                <MenuItem value="instant">Мгновенная</MenuItem>
+                <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+              </TextField>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={transferQty}
+                onChange={e => setTransferQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addStealEffect}>+ Добавить эффект кражи</Button>
+              <Button variant="outlined" onClick={addGiveEffect}>+ Добавить эффект подарка</Button>
+            </Stack>
+
+            <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+              <Typography variant="subtitle2">Обмен</Typography>
+              <TextField select label="Тип карты" size="small" value={swapCardGroup} onChange={e => setSwapCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
+                <MenuItem value="any">Любой</MenuItem>
+                <MenuItem value="unicorn">Единорог</MenuItem>
+                <MenuItem value="upgrade">Улучшение</MenuItem>
+                <MenuItem value="downgrade">Ухудшение</MenuItem>
+                <MenuItem value="instant">Мгновенная</MenuItem>
+                <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+              </TextField>
+              <Button variant="outlined" onClick={addSwapEffect}>+ Добавить эффект обмена</Button>
+            </Stack>
+
+            <Stack direction="row" spacing={2} alignItems="center">
+              <Typography variant="subtitle2">Уничтожение (только чужое стойло)</Typography>
+              <TextField
+                select
+                label="Цель"
+                size="small"
+                value={destroyScope === 'self' ? 'opponent' : destroyScope}
+                onChange={e => setDestroyScope(e.target.value as any)}
+                sx={{ width: 160 }}
+              >
+                <MenuItem value="any">Любой игрок (кроме вас)</MenuItem>
+                <MenuItem value="opponent">Соперник</MenuItem>
+              </TextField>
+              <TextField
+                select
+                label="Тип карты"
+                size="small"
+                value={destroyCardGroup}
+                onChange={e => setDestroyCardGroup(e.target.value as any)}
+                sx={{ width: 180 }}
+              >
+                <MenuItem value="any">Любая</MenuItem>
+                <MenuItem value="unicorn">Единорог</MenuItem>
+                <MenuItem value="upgrade">Улучшение</MenuItem>
+                <MenuItem value="downgrade">Ухудшение</MenuItem>
+                <MenuItem value="instant">Мгновенная</MenuItem>
+                <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+              </TextField>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={destroyQty}
+                onChange={e => setDestroyQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addDestroyStableEffect}>
+                + Добавить эффект уничтожения
+              </Button>
+            </Stack>
+
+            <Stack direction="row" spacing={2} alignItems="center">
+              <Typography variant="subtitle2">Пожертвование (своё стойло)</Typography>
+              <TextField
+                select
+                label="Тип карты"
+                size="small"
+                value={sacrificeCardGroup}
+                onChange={e => setSacrificeCardGroup(e.target.value as any)}
+                sx={{ width: 180 }}
+              >
+                <MenuItem value="any">Любая</MenuItem>
+                <MenuItem value="unicorn">Единорог</MenuItem>
+                <MenuItem value="upgrade">Улучшение</MenuItem>
+                <MenuItem value="downgrade">Ухудшение</MenuItem>
+                <MenuItem value="instant">Мгновенная</MenuItem>
+                <MenuItem value="non_unicorn">Не-единорог</MenuItem>
+              </TextField>
+              <TextField
+                type="number"
+                label="Кол-во"
+                size="small"
+                value={sacrificeQty}
+                onChange={e => setSacrificeQty(Number(e.target.value))}
+                inputProps={{ min: 1 }}
+                sx={{ width: 120 }}
+              />
+              <Button variant="outlined" onClick={addSacrificeEffect}>+ Добавить эффект пожертвования</Button>
+            </Stack>
+            </>
+            )}
+
+            <Divider textAlign="left">Выбранные эффекты</Divider>
+            <Stack spacing={1}>
+              {dslEffects.length === 0 && <Typography color="text.secondary">Эффектов пока нет</Typography>}
+              {dslEffects.map((e, idx) => (
+                <Paper key={`dsl-${idx}`} sx={{ p: 1.5 }} variant="outlined">
+                  <Stack direction="row" alignItems="center" spacing={1} justifyContent="space-between">
+                    <Typography variant="body2">{dslEffectToText(e)}</Typography>
+                    <IconButton size="small" onClick={() => setDslEffects(prev => prev.filter((_, i) => i !== idx))}>✕</IconButton>
+                  </Stack>
+                </Paper>
               ))}
-            </TextField>
-            <Button size="small" variant="outlined" onClick={() => setSelectedTriggers(ALL_TRIGGERS)}>Выбрать все</Button>
-            <Button size="small" onClick={() => setSelectedTriggers(['immediate'])}>Сбросить</Button>
-          </Stack>
-          <Stack direction="row" spacing={2} alignItems="center">
-            <Typography variant="subtitle2">Добор</Typography>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={drawQty}
-              onChange={e => setDrawQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
+            </Stack>
+
+            <Divider textAlign="left">Описание</Divider>
+            <FormControlLabel
+              control={<Switch checked={autoDesc} onChange={(_, v) => setAutoDesc(v)} />}
+              label="Генерировать автоматически"
             />
-            <Button variant="outlined" onClick={addDrawEffect}>
-              + Добавить эффект добора
+            <TextField
+              label="Описание карты"
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              disabled={autoDesc}
+              multiline
+              minRows={2}
+            />
+
+            <Divider textAlign="left">Админ-поля</Divider>
+            <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+              <FormControlLabel control={<Switch checked={active} onChange={(_, v) => setActive(v)} />} label="Активна" />
+              <TextField
+                type="number"
+                label="Количество в колоде"
+                value={deckCount}
+                onChange={e => setDeckCount(Number(e.target.value))}
+                inputProps={{ min: 0 }}
+                sx={{ width: 220 }}
+              />
+            </Stack>
+
+            <Button variant="contained" onClick={() => { createCard(); setCreateOpen(false); }} disabled={!name}>
+              Создать карту
             </Button>
           </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center">
-            <Typography variant="subtitle2">Сброс</Typography>
-            <TextField select label="Кто сбрасывает" size="small" value={discardAffects} onChange={e => setDiscardAffects(e.target.value as any)} sx={{ minWidth: 180 }}>
-              <MenuItem value="self">Только вы</MenuItem>
-              <MenuItem value="all">Все игроки</MenuItem>
-              <MenuItem value="others">Все, кроме вас</MenuItem>
-            </TextField>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={discardQty}
-              onChange={e => setDiscardQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
-            />
-            <Button variant="outlined" onClick={addDiscardEffect}>+ Добавить эффект сброса</Button>
-          </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-            <Typography variant="subtitle2">Возврат</Typography>
-            <TextField select label="Цель" size="small" value={returnScope} onChange={e => setReturnScope(e.target.value as any)} sx={{ minWidth: 140 }}>
-              <MenuItem value="any">Любой</MenuItem>
-              <MenuItem value="self">Себя</MenuItem>
-              <MenuItem value="opponent">Соперник</MenuItem>
-            </TextField>
-            <TextField select label="Куда" size="small" value={returnDest} onChange={e => setReturnDest(e.target.value as any)} sx={{ minWidth: 140 }}>
-              <MenuItem value="hand">В руку</MenuItem>
-              <MenuItem value="deck">В колоду</MenuItem>
-            </TextField>
-            <TextField select label="Тип карты" size="small" value={returnCardGroup} onChange={e => setReturnCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
-              <MenuItem value="any">Любой</MenuItem>
-              <MenuItem value="unicorn">Единорог</MenuItem>
-              <MenuItem value="upgrade">Улучшение</MenuItem>
-              <MenuItem value="downgrade">Ухудшение</MenuItem>
-              <MenuItem value="instant">Мгновенная</MenuItem>
-              <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-            </TextField>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={returnQty}
-              onChange={e => setReturnQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
-            />
-            <Button variant="outlined" onClick={addReturnEffect}>+ Добавить эффект возврата</Button>
-          </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-            <Typography variant="subtitle2">Кража/Подарок</Typography>
-            <TextField select label="Тип карты" size="small" value={transferCardGroup} onChange={e => setTransferCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
-              <MenuItem value="any">Любой</MenuItem>
-              <MenuItem value="unicorn">Единорог</MenuItem>
-              <MenuItem value="upgrade">Улучшение</MenuItem>
-              <MenuItem value="downgrade">Ухудшение</MenuItem>
-              <MenuItem value="instant">Мгновенная</MenuItem>
-              <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-            </TextField>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={transferQty}
-              onChange={e => setTransferQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
-            />
-            <Button variant="outlined" onClick={addStealEffect}>+ Добавить эффект кражи</Button>
-            <Button variant="outlined" onClick={addGiveEffect}>+ Добавить эффект подарка</Button>
-          </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-            <Typography variant="subtitle2">Обмен</Typography>
-            <TextField select label="Тип карты" size="small" value={swapCardGroup} onChange={e => setSwapCardGroup(e.target.value as any)} sx={{ minWidth: 180 }}>
-              <MenuItem value="any">Любой</MenuItem>
-              <MenuItem value="unicorn">Единорог</MenuItem>
-              <MenuItem value="upgrade">Улучшение</MenuItem>
-              <MenuItem value="downgrade">Ухудшение</MenuItem>
-              <MenuItem value="instant">Мгновенная</MenuItem>
-              <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-            </TextField>
-            <Button variant="outlined" onClick={addSwapEffect}>+ Добавить эффект обмена</Button>
-          </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center">
-            <Typography variant="subtitle2">Уничтожение (только чужое стойло)</Typography>
-            <TextField
-              select
-              label="Цель"
-              size="small"
-              value={destroyScope === 'self' ? 'opponent' : destroyScope}
-              onChange={e => setDestroyScope(e.target.value as any)}
-              sx={{ width: 160 }}
-            >
-              <MenuItem value="any">Любой игрок (кроме вас)</MenuItem>
-              <MenuItem value="opponent">Соперник</MenuItem>
-            </TextField>
-            <TextField
-              select
-              label="Тип карты"
-              size="small"
-              value={destroyCardGroup}
-              onChange={e => setDestroyCardGroup(e.target.value as any)}
-              sx={{ width: 180 }}
-            >
-              <MenuItem value="any">Любая</MenuItem>
-              <MenuItem value="unicorn">Единорог</MenuItem>
-              <MenuItem value="upgrade">Улучшение</MenuItem>
-              <MenuItem value="downgrade">Ухудшение</MenuItem>
-              <MenuItem value="instant">Мгновенная</MenuItem>
-              <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-            </TextField>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={destroyQty}
-              onChange={e => setDestroyQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
-            />
-            <Button variant="outlined" onClick={addDestroyStableEffect}>
-              + Добавить эффект уничтожения
-            </Button>
-          </Stack>
-
-          <Stack direction="row" spacing={2} alignItems="center">
-            <Typography variant="subtitle2">Пожертвование (своё стойло)</Typography>
-            <TextField
-              select
-              label="Тип карты"
-              size="small"
-              value={sacrificeCardGroup}
-              onChange={e => setSacrificeCardGroup(e.target.value as any)}
-              sx={{ width: 180 }}
-            >
-              <MenuItem value="any">Любая</MenuItem>
-              <MenuItem value="unicorn">Единорог</MenuItem>
-              <MenuItem value="upgrade">Улучшение</MenuItem>
-              <MenuItem value="downgrade">Ухудшение</MenuItem>
-              <MenuItem value="instant">Мгновенная</MenuItem>
-              <MenuItem value="non_unicorn">Не-единорог</MenuItem>
-            </TextField>
-            <TextField
-              type="number"
-              label="Кол-во"
-              size="small"
-              value={sacrificeQty}
-              onChange={e => setSacrificeQty(Number(e.target.value))}
-              inputProps={{ min: 1 }}
-              sx={{ width: 120 }}
-            />
-            <Button variant="outlined" onClick={addSacrificeEffect}>+ Добавить эффект пожертвования</Button>
-          </Stack>
-          </>
-          )}
-
-          <Divider textAlign="left">Выбранные эффекты</Divider>
-          <Stack spacing={1}>
-            {effects.length === 0 && <Typography color="text.secondary">Эффектов пока нет</Typography>}
-            {effects.map((e, idx) => (
-              <Paper key={`${idx}-${e.type}-${e.card_type ?? 'any'}-${e.quantity_affected ?? 0}`} sx={{ p: 1.5 }} variant="outlined">
-                <Stack direction="row" alignItems="center" spacing={1} justifyContent="space-between">
-                  <Typography variant="body2">{effectToText(e)}</Typography>
-                  <IconButton size="small" onClick={() => setEffects(prev => prev.filter((_, i) => i !== idx))}>
-                    ✕
-                  </IconButton>
-                </Stack>
-              </Paper>
-            ))}
-            {dslEffects.map((e, idx) => (
-              <Paper key={`dsl-${idx}`} sx={{ p: 1.5 }} variant="outlined">
-                <Stack direction="row" alignItems="center" spacing={1} justifyContent="space-between">
-                  <Typography variant="body2">{dslEffectToText(e)}</Typography>
-                  <IconButton size="small" onClick={() => setDslEffects(prev => prev.filter((_, i) => i !== idx))}>✕</IconButton>
-                </Stack>
-              </Paper>
-            ))}
-          </Stack>
-
-          <Divider textAlign="left">Описание</Divider>
-          <FormControlLabel
-            control={<Switch checked={autoDesc} onChange={(_, v) => setAutoDesc(v)} />}
-            label="Генерировать автоматически"
-          />
-          <TextField
-            label="Описание карты"
-            value={description}
-            onChange={e => setDescription(e.target.value)}
-            disabled={autoDesc}
-            multiline
-            minRows={2}
-          />
-
-          <Divider textAlign="left">Админ-поля</Divider>
-          <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
-            <FormControlLabel control={<Switch checked={active} onChange={(_, v) => setActive(v)} />} label="Активна" />
-            <TextField
-              type="number"
-              label="Количество в колоде"
-              value={deckCount}
-              onChange={e => setDeckCount(Number(e.target.value))}
-              inputProps={{ min: 0 }}
-              sx={{ width: 220 }}
-            />
-          </Stack>
-
-          <Button variant="contained" onClick={createCard} disabled={!name}>
-            Создать карту
-          </Button>
-        </Stack>
-      </Paper>
+        </Paper>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setCreateOpen(false)}>Закрыть</Button>
+        </DialogActions>
+      </Dialog>
 
       <Typography variant="h6" gutterBottom>
         Превью карточки
@@ -1452,6 +1424,9 @@ export default function Admin() {
             setEType(c.type);
             setEDescription(c.description || '');
             setEImageUrl(c.image || '');
+            setEImageFile(null);
+            setEImageError('');
+            setEImageUploading(false);
             setEActive((c as any).active ?? true);
             setEDeckCount(Number((c as any).deck_count ?? 1));
             try { setEEffectsJson(JSON.stringify((c as any).effects ?? [], null, 2)); } catch { setEEffectsJson('[]'); }
@@ -1512,7 +1487,67 @@ export default function Admin() {
                 ))}
               </TextField>
             </Stack>
-            <TextField label="Ссылка на изображение" value={eImageUrl} onChange={e => setEImageUrl(e.target.value)} />
+            <Stack spacing={1}>
+              <Stack direction="row" spacing={1} alignItems="flex-start" flexWrap="wrap">
+                <TextField
+                  label="Ссылка на изображение"
+                  value={eImageUrl}
+                  onChange={e => setEImageUrl(e.target.value)}
+                  sx={{ flex: 1, minWidth: 260 }}
+                  helperText="Вставьте внешний URL или загрузите файл с компьютера"
+                />
+                <Button
+                  variant="outlined"
+                  onClick={() => eImageInputRef.current?.click()}
+                  disabled={eImageUploading}
+                  startIcon={eImageUploading ? <CircularProgress size={16} color="inherit" /> : undefined}
+                  sx={{ mt: 0.5, whiteSpace: 'nowrap' }}
+                  data-marker="edit-image-upload-button"
+                >
+                  {eImageUploading ? 'Загрузка…' : 'Загрузить изображение'}
+                </Button>
+                <Button
+                  variant="text"
+                  color="inherit"
+                  onClick={() => { setEImageUrl(''); setEImageFile(null); setEImageError(''); }}
+                  disabled={!eImageUrl || eImageUploading}
+                  sx={{ mt: 0.5 }}
+                  data-marker="edit-image-clear-button"
+                >
+                  Очистить
+                </Button>
+                <input
+                  ref={eImageInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  style={{ display: 'none' }}
+                  data-marker="edit-image-file-input"
+                  onChange={e => {
+                    const f = e.target.files?.[0] || null;
+                    // Сбрасываем значение: иначе повторный выбор того же файла не вызовет onChange
+                    e.target.value = '';
+                    if (f) void uploadEditImage(f);
+                  }}
+                />
+              </Stack>
+              {eImageFile && (
+                <Typography variant="caption" color="text.secondary">Файл: {eImageFile.name}</Typography>
+              )}
+              {eImageError && <Alert severity="error" data-marker="edit-image-error">{eImageError}</Alert>}
+              {eImageUrl && (
+                <Box>
+                  <Typography variant="caption" color="text.secondary">Превью изображения</Typography>
+                  <Box
+                    component="img"
+                    src={resolveServerImage(eImageUrl)}
+                    alt="Превью изображения карты"
+                    data-marker="edit-image-preview"
+                    onError={() => setEImageError('Изображение не открывается по этой ссылке')}
+                    sx={{ display: 'block', mt: 0.5, maxHeight: 120, maxWidth: '100%', objectFit: 'contain', borderRadius: 1, border: '1px solid rgba(0,0,0,0.12)' }}
+                  />
+                </Box>
+              )}
+            </Stack>
             <TextField label="Описание" value={eDescription} onChange={e => setEDescription(e.target.value)} multiline minRows={3} />
             <Divider textAlign="left">Админ-поля</Divider>
             <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">

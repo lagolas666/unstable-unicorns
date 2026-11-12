@@ -1,0 +1,2058 @@
+import { Action, Card, Effect, TargetSelector } from '../../../shared/src/types';
+import { EventBus, GameEvent } from './events';
+import { GameState, PlayerState, getZoneArray } from './state';
+// Единый расчёт победителя: раньше здесь была третья копия, расходившаяся с gameService
+// (не исключала transforms_unicorn и перерешала уже выставленного победителя).
+import { maybeEndOnDeckEmpty as endGameOnDeckEmpty } from './leader';
+import { cardSubtypeTags, isUnicornCard, cardMatchesGroup, isCardAvailableFromZone, isMaskedUnicorn, isActionBlockedByMask, isNurseryOnly } from './unicornTypes';
+import { HAND_LIMIT_BASE } from '../game/config';
+import { handLimitFor } from './handLimit';
+
+// В6-2a/scope: запись о неразобранном селекторе. Форма согласована с Аналитиком:
+// {cardId, mdNum, kind, rawScope, reason} — по ним видно, что именно не сыграло.
+export interface ScopeUnresolved {
+  cardId: string;
+  mdNum?: number;
+  kind: string;
+  rawScope: string;
+  reason: string;
+}
+
+export interface ResolveContext {
+  state: GameState;
+  bus: EventBus;
+  /**
+   * Optional: when resolving effects that require explicit targets (e.g., destroy),
+   * routes may populate selectedTargets[sourceCardId] with card IDs chosen by the actor.
+   */
+  selectedTargets?: Record<string, string[]>;
+  /**
+   * Optional: when action requires selecting a player (e.g., destination stable for attach/move),
+   * routes may populate selectedPlayers[sourceCardId] with playerId (or ids).
+   */
+  selectedPlayers?: Record<string, string | string[]>;
+  /**
+   * Internally set during resolveEffect to let action executors know which source card is active.
+   */
+  currentSourceId?: string;
+  /**
+   * Колбэк, предоставляемый роутером, чтобы инициировать окно реакций для триггерных эффектов.
+   * Если задан, резолвер может не выполнять эффект немедленно, а создать pending-окно.
+   */
+  requestReactionWindow?: (params: {
+    trigger: 'when_destroyed' | 'when_enters';
+    actorId: string;
+    sourceCardId: string;
+    effectIdx: number;
+    uncounterable?: boolean;
+    allow_intercept?: boolean;
+  }) => void;
+  /**
+   * Пометка для полного предотвращения выполнения эффекта по sourceCardId.
+   */
+  preventEffects?: Record<string, boolean>;
+  /**
+   * Пометка для игнорирования конкретных целей по sourceCardId.
+   */
+  ignoreTargets?: Record<string, string[]>;
+  /**
+   * Колбэк окна выбора защитника (await_choice) для force_discard.
+   * true = окно открыто: движок обязан остановиться и не трогать руку защитника.
+   */
+  /**
+   * В6-2a: действия, у которых selector.scope не разобран движком. Заполняется на входе
+   * resolveEffect; маршруты забирают список и отдают его в ack.extra.
+   * Молчаливого «стреляем в себя» больше нет — такие действия не исполняются.
+   */
+  scopeUnresolved?: ScopeUnresolved[];
+  /**
+   * В6-3a/3-A: след пропущенного optional-добора. Optional draw адресован не актору (others/all) —
+   * без согласия получателя он не исполняется, но пропуск обязан быть виден:
+   * {cardId, kind, targetPlayer, playerId, quantity}. Молчаливых пропусков нет.
+   */
+  optionalSkipped?: Array<{ cardId: string; kind: string; targetPlayer: string; playerId: string; quantity: number }>;
+  /** В6-2a: kind текущего действия — нужен getScopePlayers, чтобы отличить баг scope от неисполнимого kind. */
+  currentActionKind?: string;
+  requestChoice?: (params: {
+    actorId: string;
+    chooserId: string;
+    sourceCardId: string | null;
+    options: string[];
+    remaining: number;
+    done: string[];
+    purpose?: string;
+    deferred?: any;
+  }) => boolean;
+}
+
+// Helper: попытаться перехватить магию, попавшую в сброс — если у кого-то есть Mystic Rainbow Unicorn
+export function maybeInterceptMagicToHand(ctx: ResolveContext, originOwner: PlayerState, cardId: string): void {
+  const card = ctx.state.cards[cardId] as any;
+  if (!card || String(card.type) !== 'magic') return;
+  // Найти владельца Mystic Rainbow Unicorn
+  let catcher: PlayerState | undefined;
+  for (const p of ctx.state.players) {
+    for (const cid of p.stable) {
+      const c = ctx.state.cards[cid] as any;
+      const nameLower = String((c?.name || c?.Название || '')).toLowerCase();
+      if (nameLower.includes('mystic') && nameLower.includes('rainbow') && nameLower.includes('unicorn')) {
+        catcher = p; break;
+      }
+    }
+    if (catcher) break;
+  }
+  // Только если это другой игрок ("another player")
+  if (!catcher || catcher.id === originOwner.id) return;
+  // Найти реальный массив discard и изъять карту
+  const discardArr = getZoneArrayWithShared(ctx, originOwner, 'discard');
+  const idx = discardArr.indexOf(cardId);
+  if (idx === -1) return;
+  discardArr.splice(idx, 1);
+  catcher.hand.push(cardId);
+}
+
+function hasDoubleDestroyBonus(ctx: ResolveContext, player: PlayerState): boolean {
+  // If player controls a card with flag double_destroy=true or named 'Epic Level Unicorn'
+  for (const cid of player.stable) {
+    const c: any = (ctx.state.cards as any)[cid];
+    if (!c) continue;
+    if (c.double_destroy === true) return true;
+    const name = String((c?.name || c?.Название || '')).toLowerCase();
+    if (name.includes('epic level unicorn')) return true;
+  }
+  return false;
+}
+
+// Замена уничтожения/жертвы (Единорог-Архангел): решает ДАННЫЕ, а не имя карты.
+// Карта в стойле владельца с опциональным триггером on_would_be_destroyed_or_sacrificed даёт замену.
+// Малыш-Архангел (effects: []) замены не даёт, поэтому имя здесь не сравниваем.
+function findDestroyReplacer(ctx: ResolveContext, owner: PlayerState): string | null {
+  for (const cid of owner.stable) {
+    const c: any = ctx.state.cards[cid];
+    const effs: any[] = Array.isArray(c?.effects) ? c.effects : [];
+    if (effs.some((e) => e?.trigger === 'on_would_be_destroyed_or_sacrificed' && e.optional === true)) return cid;
+  }
+  return null;
+}
+
+// Нужна ли замена выбором владельца. 'none' — замены нет, уничтожаем штатно.
+// 'open' — открыто окно выбора владельца, карта НЕ мутирует до ответа.
+// 'blocked' — спросить нельзя (другое окно открыто), карту не трогаем.
+function resolveDestroyReplacement(ctx: ResolveContext, actor: PlayerState, owner: PlayerState, zone: any, cardId: string, kind: 'destroy' | 'sacrifice'): 'none' | 'open' | 'blocked' {
+  if ((ctx as any).payingCosts) return 'none';
+  if (zone !== 'stable' || owner.hand.length === 0) return 'none';
+  const replacerId = findDestroyReplacer(ctx, owner);
+  if (!replacerId) return 'none';
+  if (!ctx.requestChoice) return 'blocked';
+  const opened = ctx.requestChoice({
+    actorId: actor.id,
+    chooserId: owner.id,
+    sourceCardId: replacerId,
+    options: owner.hand.slice(),
+    remaining: 1,
+    done: [],
+    purpose: 'archangel_prevent',
+    deferred: { zone, cardId, kind },
+  });
+  return opened ? 'open' : 'blocked';
+}
+
+// Штатное уничтожение/жертва, отложенное окном замены: вызывается при отказе или таймауте владельца.
+export async function completeDeferredDestroy(ctx: ResolveContext, owner: PlayerState, zone: any, cardId: string, kind: 'destroy' | 'sacrifice'): Promise<void> {
+  const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+  const idx = srcArr.indexOf(cardId);
+  if (idx === -1) return;
+  srcArr.splice(idx, 1);
+  sendCardTo(ctx, owner, cardId, owner.discard);
+  zombieKnightReturn(ctx, owner, cardId);
+  if (kind === 'destroy') {
+    maybeInterceptMagicToHand(ctx, owner, cardId);
+    await triggerDestroyedEffectsFor(ctx, owner, cardId);
+  }
+}
+
+export type TurnStartPrompt = { sourceCardId: string; effectIdx: number; uncounterable?: boolean };
+
+/**
+ * Trigger all effects with trigger=on_turn_start for the given player (assumes phase begin_turn).
+ * Returns a list of optional effects that require player's choice (prompts). Non-optional effects are resolved immediately.
+ */
+export async function triggerTurnStartEffects(ctx: ResolveContext, currentPlayerId: string): Promise<TurnStartPrompt[]> {
+  const player = ctx.state.players.find(p => p.id === currentPlayerId);
+  if (!player) return [];
+  // Iterate over all cards the player controls (primarily stable) and trigger their on_turn_start effects
+  const ownedZones: Array<{ zone: 'stable' | 'field' } & { ids: string[] }> = [
+    { zone: 'stable', ids: player.stable },
+    { zone: 'field', ids: player.field },
+  ];
+  // Compute phases the player will skip this turn from continuous effects in their stable
+  const skipped = new Set<string>();
+  for (const cid of player.stable) {
+    const c = ctx.state.cards[cid] as any;
+    const arr = (c?.skip_phases as string[]) || [];
+    for (const ph of arr) skipped.add(String(ph));
+  }
+  const prompts: TurnStartPrompt[] = [];
+  for (const { zone, ids } of ownedZones) {
+    for (const cid of [...ids]) { // copy to avoid mutation issues
+      const card = ctx.state.cards[cid];
+      if (!card || !Array.isArray((card as any).effects)) continue;
+      const effects = (card as any).effects as Effect[];
+      for (let i = 0; i < effects.length; i++) {
+        const eff = effects[i];
+        if (eff.trigger !== 'on_turn_start') continue;
+        // If effect is blocked by player's skipped phases, do not trigger it
+        const blockedList = (eff as any).blocked_by_phase_skip as string[] | undefined;
+        if (blockedList && blockedList.some(ph => skipped.has(String(ph)))) {
+          continue;
+        }
+        // Respect while_source_in if provided
+        const whileZone = (eff as any).while_source_in as any | undefined;
+        if (whileZone) {
+          // verify source still in the specified zone for some owner
+          let found = false;
+          for (const p of ctx.state.players) {
+            const arr = getZoneArrayWithShared(ctx, p, whileZone);
+            if (arr.includes(cid)) { found = true; break; }
+          }
+          if (!found) continue;
+        }
+        if (eff.optional) {
+          prompts.push({ sourceCardId: cid, effectIdx: i, uncounterable: !!(eff as any).uncounterable });
+        } else {
+          await resolveEffect(ctx, player, cid, eff);
+        }
+      }
+    }
+  }
+  return prompts;
+}
+
+// Helper: return zone array respecting shared piles if present
+function getZoneArrayWithShared(ctx: ResolveContext, player: PlayerState, zone: any): string[] {
+  if (zone === 'deck' && ctx.state.deck) return ctx.state.deck;
+  if (zone === 'discard' && ctx.state.discard) return ctx.state.discard;
+  return getZoneArray(player, zone as any);
+}
+
+// exclude_self: карта, породившая эффект, не может быть выбрана целью собственного действия.
+// BUG-NM-EXSELF: флаг стоит у 13 карт каталога v2, но движок его не читал —
+// nightmare_unicorn_ultimate (sacrifice 3 при входе в стойло) жертвовал сам себя.
+function matchesFilter(card: Card | undefined, filter: any, sourceId?: string): boolean {
+  if (!filter || !card) return true;
+  if (filter.exclude_self === true && sourceId && card.id === sourceId) return false;
+  if (filter.card_group && !matchesCardGroup(card, filter.card_group)) return false;
+  if (filter.category && filter.category !== 'any' && card.type !== filter.category) return false;
+  if (filter.subtype && !cardSubtypeTags(card).includes(String(filter.subtype))) return false;
+  if (filter.name && card.name !== filter.name) return false;
+  if (filter.tags && filter.tags.length) {
+    const tags = card.tags || [];
+    for (const t of filter.tags) if (!tags.includes(t)) return false;
+  }
+  return true;
+}
+
+// Basic immunity flags support
+function hasTag(card: Card | undefined, tag: string): boolean {
+  if (!card) return false;
+  const tags = (card as any).tags as string[] | undefined;
+  return !!(tags && tags.includes(tag));
+}
+
+function hasImmunity(card: Card | undefined, kind: string): boolean {
+  if (!card) return false;
+  const immuneList = ((card as any).immune as string[] | undefined) || [];
+  if (immuneList.includes(kind)) return true;
+  // also respect explicit boolean flags if present on card
+  if (kind === 'destroy' && ((card as any).cannot_be_destroyed === true || hasTag(card, 'cannotBeDestroyed'))) return true;
+  // cannot be targeted blocks any hostile targeting
+  if ((card as any).cannot_be_targeted === true || hasTag(card, 'cannotBeTargeted')) return true;
+  return false;
+}
+
+function isTargetableFor(actionKind: string, card: Card | undefined, actorId: string, ownerId: string, state?: GameState): boolean {
+  if (!card) return false;
+  // Аура маски: пока штраф-маска лежит в конюшне владельца, его единорога нельзя выбрать целью
+  // для sacrifice/steal/destroy/move/swap. Собственные эффекты самой карты при этом не отключаются.
+  if (state && isActionBlockedByMask(actionKind) && isMaskedUnicorn(state, card, ownerId)) return false;
+  // self-targeting is always allowed unless explicit immunity to that action exists
+  const hostile = actorId !== ownerId;
+  if (!hostile) {
+    if (actionKind === 'destroy') return !hasImmunity(card, 'destroy');
+    return true;
+  }
+  // hostile actions respect cannot_be_targeted and specific immunities
+  if ((card as any).cannot_be_targeted === true || hasTag(card, 'cannotBeTargeted')) return false;
+  if (actionKind === 'destroy' && hasImmunity(card, 'destroy')) return false;
+  if (actionKind === 'steal' && (hasTag(card, 'neighproof') || ((card as any).immune && (card as any).immune.includes('steal')))) return false;
+  return true;
+}
+
+// Единый классификатор из engine/unicornTypes.ts (4 типа каталога, без generic 'unicorn').
+function isUnicornCategory(t: Card['type']): boolean {
+  return isUnicornCard(t);
+}
+
+// Делегирует канонический классификатор (учитывает массивы групп из каталога v2).
+function matchesCardGroup(card: Card | undefined, group: any): boolean {
+  return cardMatchesGroup(card, group);
+}
+
+// Helper: place a found card according to place mode
+async function placeFoundCard(
+  ctx: ResolveContext,
+  actor: PlayerState,
+  cardId: string,
+  place: 'hand' | 'stable' | 'top_deck' | 'play_now' | undefined
+): Promise<void> {
+  const card = ctx.state.cards[cardId] as any;
+  const mode = place || 'hand';
+  if (mode === 'hand') {
+    actor.hand.push(cardId);
+    return;
+  }
+  if (mode === 'top_deck') {
+    const deck = (ctx.state.deck ?? actor.deck);
+    deck.push(cardId);
+    return;
+  }
+  if (mode === 'stable') {
+    actor.stable.push(cardId);
+    await triggerEnterEffectsFor(ctx, actor, cardId);
+    return;
+  }
+  if (mode === 'play_now') {
+    // Minimal semantics:
+    // - Unicorns: enter stable and trigger enter effects
+    // - Magic/Instant: resolve first immediate/on_play effect, then send to discard
+    const t = String(card?.type || '');
+    if (isUnicornCategory(t as any)) {
+      actor.stable.push(cardId);
+      await triggerEnterEffectsFor(ctx, actor, cardId);
+      return;
+    }
+    // Magic/Instant
+    const effects = (card?.effects as any[]) || [];
+    const eff = effects.find((e) => e && (e.trigger === 'immediate' || e.trigger === 'on_play'));
+    if (eff) {
+      await resolveEffect(ctx, actor, cardId, eff as any);
+    }
+    // Place into discard by default after play_now for non-unicorns
+    actor.discard.push(cardId);
+    return;
+  }
+}
+
+// Helper: when a card is moved into a stable with on_enter_mode, execute its on_play/on_enter_stable effects
+export async function triggerEnterEffectsFor(ctx: ResolveContext, owner: PlayerState, cardId: string, opts?: { skipGenericLoop?: boolean }): Promise<void> {
+  const card = ctx.state.cards[cardId];
+  if (!card) return;
+  const effects = (Array.isArray((card as any).effects) ? (card as any).effects : []) as Effect[];
+  // Вход в стойло: единственный источник истины — данные карты (effects.on_enter_stable), драйвер ниже.
+  // Фолбэк-блоки по имени (Nightmare / Archangel) снесены 05.11.2026: у Малышей (baby_nightmare_unicorn,
+  // baby_archangel_unicorn) effects: [] и пустой текст карты, а подстрока "nightmare"/"archangel" ложно
+  // запускала жертву 3 карт, включая саму карту-источник (BUG-NM-EXSELF на Малыше: вход в стойло → сброс).
+  // У ultimate-версий эффект входа уже в данных, поэтому фолбэк им был не нужен и не исполнялся.
+  // Generic-цикл: вызов из playCard пропускает его целиком — on_play уже исполнен там (gameService L624–629).
+  // on_enter_stable в generic-цикле больше не слушаем: вход в стойло идёт из данных (effects.on_enter_stable).
+  // Драйвер входа в стойло из данных (вариант 1, решение Аналитика 03.11.2026):
+  // on_enter_stable из каталога исполняется ДО проверки skipGenericLoop, потому что playCard
+  // глушит только generic-цикл on_play, а вход в стойло обязан работать и при skipGenericLoop: true.
+  // optional: true автоматически не исполняем — это выбор игрока, окна выбора на входе пока нет.
+  for (let i = 0; i < effects.length; i++) {
+    const effEnter = effects[i] as any;
+    if (effEnter && effEnter.trigger === 'on_enter_stable' && effEnter.optional !== true) {
+      await resolveEffect(ctx, owner, cardId, effEnter);
+    }
+  }
+  if (opts?.skipGenericLoop) return;
+  for (let i = 0; i < effects.length; i++) {
+    const eff = effects[i] as any;
+    if (eff.trigger === 'on_play') {
+      // Если доступен колбэк открытия окна и эффект потенциально конфликтный — инициируем окно
+      const actions = Array.isArray(eff.actions) ? eff.actions : [];
+      const hasDanger = actions.some((a: any) => ['destroy', 'steal', 'sacrifice'].includes(String(a?.kind)));
+      const uncounterable = !!eff.uncounterable;
+      const allowIntercept = actions.some((a: any) => a && a.kind === 'steal');
+      if (ctx.requestReactionWindow && (hasDanger || uncounterable || allowIntercept)) {
+        ctx.requestReactionWindow({
+          trigger: 'when_enters',
+          actorId: owner.id,
+          sourceCardId: cardId,
+          effectIdx: i,
+          uncounterable,
+          allow_intercept: allowIntercept,
+        });
+      } else {
+        await resolveEffect(ctx, owner, cardId, eff);
+      }
+    }
+  }
+}
+
+// Helper: when a card is destroyed (moved from stable to discard), execute its when_destroyed effects for the previous owner
+async function triggerDestroyedEffectsFor(ctx: ResolveContext, owner: PlayerState, cardId: string): Promise<void> {
+  const card = ctx.state.cards[cardId];
+  if (!card || !Array.isArray((card as any).effects)) return;
+  const effects = (card as any).effects as Effect[];
+  for (let i = 0; i < effects.length; i++) {
+    const eff = effects[i] as any;
+    if (eff.trigger === 'when_destroyed') {
+      const actions = Array.isArray(eff.actions) ? eff.actions : [];
+      const hasDanger = actions.some((a: any) => ['destroy', 'steal', 'sacrifice'].includes(String(a?.kind)));
+      const uncounterable = !!eff.uncounterable;
+      const allowIntercept = actions.some((a: any) => a && a.kind === 'steal');
+      if (ctx.requestReactionWindow && (hasDanger || uncounterable || allowIntercept)) {
+        ctx.requestReactionWindow({
+          trigger: 'when_destroyed',
+          actorId: owner.id,
+          sourceCardId: cardId,
+          effectIdx: i,
+          uncounterable,
+          allow_intercept: allowIntercept,
+        });
+      } else {
+        await resolveEffect(ctx, owner, cardId, eff);
+      }
+    }
+  }
+}
+
+// Обёртка над единой реализацией (engine/leader.ts): считает он, здесь только ctx -> state.
+// Guard по winnerId и правило transforms_unicorn теперь общие с gameService.leaderByUnicorns.
+function maybeEndOnDeckEmpty(ctx: ResolveContext): void {
+  endGameOnDeckEmpty(ctx.state);
+}
+
+export interface ResolutionResult {
+  success: boolean;
+}
+
+function isActionPossible(ctx: ResolveContext, player: PlayerState, action: Action): boolean {
+  // Виды pull / force_discard / return_to_hand отсутствуют в union ActionKind, поэтому проверяются
+  // до switch по строке (case по ним даёт TS2678) — тем же приёмом, что 'draw' в executeAction.
+  const extraKind = String((action as any)?.kind);
+  normalizeActionTargets(action as any); // Б1: destroy/sacrifice/discard читают .targets, каталог даёт .target
+  if (extraKind === 'pull' || extraKind === 'force_discard') {
+    // Нужен хотя бы один соперник, у которого есть что забрать или сбросить.
+    return ctx.state.players.some(p => p.id !== player.id && p.hand.length > 0);
+  }
+  if (extraKind === 'return_to_hand') {
+    // Возвращать в руку можно только то, что уже лежит в сбросе владельца.
+    return player.discard.length > 0;
+  }
+  // Minimal feasibility checks; expand per kind
+  switch (action.kind) {
+    case 'destroy': {
+      // В6-2a/scope: раньше opponentsOnly был жёстко true, поэтому destroy со scope 'self'
+      // считался невозможным ещё до исполнения. Условие то же, что в executeAction.
+      const selD = action && ((action as any).targets || (action as any).target as any);
+      if (!selD) return false;
+      const sc = (selD as any).scope;
+      const wide = sc === 'any' || sc === 'any_player' || sc === 'all_players' || sc === 'self';
+      return countAvailableTargets(ctx, player, selD, /*opponentsOnly*/ !wide) > 0;
+    }
+    case 'sacrifice':
+    case 'discard':
+      return action && (action as any).targets ? countAvailableTargets(ctx, player, (action as any).targets, /*opponentsOnly*/ false, /*selfOnlyForSacrifice*/ false) > 0 : false;
+    case 'move':
+    case 'steal':
+    case 'give':
+    case 'return': {
+      // D5: тот же селектор, что и в executeAction, иначе предпроверка отсекает действие,
+      // которое сама ветвь исполнить умеет.
+      const selMove = actionSelector(action as any);
+      return selMove ? countAvailableTargets(ctx, player, selMove) > 0 : false;
+    }
+    case 'swap': {
+      // D6/BUG-SWAP-01: предпроверка обязана читать те же селекторы, что и ветвь исполнения, —
+      // легаси .a/.b и каталог .target/.destination. Раньше здесь стоял actionSelector, про .a/.b
+      // он не знает, и легаси-форма отсекалась до исполнения (ветвь её при этом поддерживает).
+      const selSwap = swapSelectors(action as any);
+      if (!selSwap.a || !selSwap.b) return false;
+      const ownersA = swapSideOwners(ctx, player, selSwap.a, false);
+      const ownersB = swapSideOwners(ctx, player, selSwap.b, true);
+      // BUG-SWAP-03: неоднозначный автоподбор (несколько соперников без явного выбора) отсекаем
+      // уже здесь, иначе UI считает карту играбельной, а исполнение честно вернёт false.
+      const bResolved = swapOpponentCandidates(ctx, ownersB, selSwap.b, player.id);
+      if (!bResolved || bResolved.length === 0) return false;
+      // Обмен возможен, только если есть что взять с обеих сторон: пустая рука соперника → false,
+      // а не окно выбора и не «успех без эффекта».
+      return countTargetsForOwners(ctx, ownersA, selSwap.a) > 0 && countTargetsForOwners(ctx, bResolved, selSwap.b) > 0;
+    }
+    case 'draw_conditional':
+    case 'draw_until_limit': {
+      // Без карт в колоде добор невозможен — не открываем окно выбора зря.
+      const pDeck = getZoneArrayWithShared(ctx, player, 'deck');
+      return Array.isArray(pDeck) && pDeck.length > 0;
+    }
+    case 'search':
+      return true;
+    default:
+      return true;
+  }
+}
+
+// Б1: в каталоге (files/UNICORNS.md) цель лежит в ключе action.target, движок читает action.targets.
+// Одна нормализация на входе вместо правки каждого case: иначе destroy/search молча промахиваются.
+function normalizeActionTargets(action: any): void {
+  if (action && !action.targets && action.target) {
+    action.targets = action.target;
+  }
+}
+
+// D5: единый селектор источника для ветвей переноса. Каталог v2 (files/UNICORNS.md) кладёт
+// селектор в .target, легаси-импорт (seedCards/import) — в .from/.source. Пока каждая ветвь
+// читала своё имя ключа, 128 действий переноса из каталога выпадали молча (дефект D5,
+// docs/qa-d5-selector-report.md). Возвращаем только объект: у 'add' .source — строка-зона.
+function actionSelector(action: any): TargetSelector | undefined {
+  if (!action) return undefined;
+  const raw = action.from ?? action.source ?? action.target ?? action.targets;
+  return raw && typeof raw === 'object' ? (raw as TargetSelector) : undefined;
+}
+
+// D5: единое назначение в виде { scope, zone }. Каталог даёт строку-зону .destination и
+// владельца .destination_player ('self' | 'chosen'), легаси — готовый объект .to.
+function actionDestination(action: any): { scope: string; zone: any } | undefined {
+  if (!action) return undefined;
+  if (action.to && typeof action.to === 'object') return action.to as { scope: string; zone: any };
+  const zone = typeof action.destination === 'string' ? action.destination : undefined;
+  if (!zone) return undefined;
+  const dp = String(action.destination_player ?? 'self');
+  const scope = dp === 'chosen' || dp === 'opponent' || dp === 'any_player' ? 'any_player' : dp;
+  return { scope, zone };
+}
+
+// Б1: записать пропуск фазы в текущий ход (дедупликация на месте).
+function stateTurnSkip(ctx: ResolveContext, phase: string): void {
+  const turn = ctx.state.turn as any;
+  turn.skippedPhases = Array.isArray(turn.skippedPhases) ? turn.skippedPhases : [];
+  if (!turn.skippedPhases.includes(phase)) turn.skippedPhases.push(phase);
+}
+
+function countAvailableTargets(ctx: ResolveContext, player: PlayerState, selector?: TargetSelector, opponentsOnly = false, selfOnly = false): number {
+  // Very coarse for now: only zone-based, ignoring filters
+  if (!selector) return 0;
+  if ((selector as any).zone === 'any') return 1; // treat as possible
+  let scopePlayers = getScopePlayers(ctx, player, selector);
+  if (opponentsOnly) scopePlayers = scopePlayers.filter(p => p.id !== player.id);
+  if (selfOnly) scopePlayers = [player];
+  let total = 0;
+  for (const p of scopePlayers) {
+    const arr = getZoneArrayWithShared(ctx, p, (selector as any).zone as any);
+    // apply basic filters if provided
+    const f = (selector as any).filters;
+    if (!f) {
+      total += arr.length;
+    } else {
+      for (const id of arr) {
+        const c = ctx.state.cards[id];
+        if (matchesFilter(c, f, (ctx as any).currentSourceId as string | undefined)) total++;
+      }
+    }
+  }
+  return total;
+}
+
+// В6-2a/scope: счётчик срабатываний алиаса. Нужен в отчёте, чтобы «тихо починили» не осталось незамеченным.
+function noteScopeAlias(ctx: ResolveContext, alias: string): void {
+  const c = ctx as any;
+  c.scopeAliasHits = c.scopeAliasHits || {};
+  c.scopeAliasHits[alias] = (c.scopeAliasHits[alias] || 0) + 1;
+}
+
+// В6-2a/scope: какие значения scope движок понимает. 'hand' и 'discard' — зоны, не владельцы:
+// их разбирает сам case (getZoneArrayWithShared), в getScopePlayers они не попадают.
+const SCOPE_PLAYER_VALUES = new Set(['self', 'opponent', 'any', 'any_player', 'all_players', 'hand', 'discard']);
+// 'stack' — не зона и не владелец: это карта в момент резолва (pending.lastCancelCardId в gameService).
+// В ResolveContext стека нет, поэтому такие действия честно уходят в unresolved до В6-3.
+const SCOPE_STACK = 'stack';
+
+function reportScopeUnresolved(ctx: ResolveContext, player: PlayerState, sourceCardId: string, actions: any[]): void {
+  if (!Array.isArray(actions)) return;
+  const c = ctx as any;
+  const card = ctx.state.cards[sourceCardId] as any;
+  c.scopeUnresolved = Array.isArray(c.scopeUnresolved) ? c.scopeUnresolved : [];
+  for (const action of actions) {
+    const sel = action && (action.target || action.targets);
+    const rawScope = sel && sel.scope;
+    if (rawScope === undefined || rawScope === null) continue;
+    // Неизвестный scope — не исполняем ни в каком виде: ни self, ни «ближайшее похожее».
+    if (SCOPE_PLAYER_VALUES.has(rawScope)) continue;
+    const reason = rawScope === SCOPE_STACK ? 'stack_target_unsupported' : 'scope_unsupported';
+    c.scopeUnresolved.push({
+      cardId: sourceCardId,
+      mdNum: card && typeof card.md_num === 'number' ? card.md_num : undefined,
+      kind: action.kind,
+      rawScope: String(rawScope),
+      reason,
+    });
+  }
+}
+
+function getScopePlayers(ctx: ResolveContext, player: PlayerState, selector?: TargetSelector): PlayerState[] {
+  if (!selector || !(selector as any).scope) return [player];
+  switch ((selector as any).scope) {
+    case 'self':
+      return [player];
+    case 'opponent': {
+      return ctx.state.players.filter(p => p.id !== player.id);
+    }
+    // 'any' — значение каталога (catalog.v2.json), 'any_player' — прежнее значение движка.
+    // Алиас терпимый: считаем срабатывания и пишем их в отчёт, чтобы расхождение было видно.
+    case 'any':
+    case 'any_player':
+      noteScopeAlias(ctx, 'any→any_player');
+      return ctx.state.players;
+    case 'all_players':
+      return ctx.state.players; // caller will treat as all
+    default:
+      // БЫЛО: молчаливое return [player] — destroy со scope 'any' бил в своё стойло вместо чужого.
+      // СТАЛО: пустой список. Действие не исполнится и вернёт false, а не выстрелит в себя.
+      return [];
+  }
+}
+
+// D6: разбор селекторов swap в одном месте — предпроверка и исполнение обязаны видеть одно и то же.
+// Каталог v2: .target (источник) + .destination/.destination_player (назначение).
+// Легаси: явные .a/.b, которых actionSelector не знает (дефект BUG-SWAP-01).
+function swapSelectors(action: any): { a?: TargetSelector; b?: TargetSelector } {
+  const legacyA = action?.a as TargetSelector | undefined;
+  const legacyB = action?.b as TargetSelector | undefined;
+  const single = legacyA && legacyB ? undefined : actionSelector(action);
+  const dest = actionDestination(action);
+  const a = (legacyA ?? single) as TargetSelector | undefined;
+  const b = (legacyB ?? dest ?? single) as TargetSelector | undefined;
+  return { a, b };
+}
+
+// D6/BUG-SWAP-02: владельцы для стороны swap. Назначение в широком scope (any/any_player/all_players)
+// не может указывать на самого актора — getScopePlayers возвращал всех, и сторона B добирала карту
+// из собственной руки, то есть обмен вырождался в перестановку своих же карт при ok=true.
+// Собственная зона в назначении остаётся законной: это обмен между своими зонами.
+function swapSideOwners(
+  ctx: ResolveContext,
+  player: PlayerState,
+  selector: TargetSelector | undefined,
+  isDestination: boolean,
+): PlayerState[] {
+  if (!selector) return [];
+  const owners = getScopePlayers(ctx, player, selector);
+  if (!isDestination) return owners;
+  const sc = String((selector as any).scope || '');
+  if (sc !== 'any' && sc !== 'any_player' && sc !== 'all_players') return owners;
+  return owners.filter(o => o.id !== player.id);
+}
+
+// BUG-SWAP-03: обмен идёт ровно с ОДНИМ соперником. Каталог даёт destination_player 'chosen',
+// actionDestination схлопывал его в scope 'any_player' (все игроки), collectSide собирал по карте
+// с каждого соперника, а takeOut вкладывал набор одной стороны в КАЖДУЮ руку другой — карта актора
+// клонировалась: 3 игрока 3 карты → 4, 4 игрока 8 → 12, 6 игроков 6 → 9 при ok=true.
+// На 2 игроках дефект невидим (кандидат ровно один), поэтому S1-S5 оставались зелёными.
+// Правило: кандидатов несколько и транспорт не передал явный выбор (selectedPlayers[sourceId]) —
+// берём того, у кого есть подходящая карта, только если он ровно один; иначе undefined (отказ),
+// окно выбора открывает транспорт, раздачи всем не бывает.
+function swapOpponentCandidates(
+  ctx: ResolveContext,
+  owners: PlayerState[],
+  selector: TargetSelector,
+  // BUG-SWAP-05-follow-up: актор нужен, чтобы автоподбор и ветвь исполнения
+  // (collectSide → isTargetableFor) отсекали одних и тех же соперников.
+  actorId?: string,
+): PlayerState[] | undefined {
+  if (!Array.isArray(owners)) return [];
+  if (owners.length === 0) return [];
+  // Остаток BUG-SWAP-05-follow-up (07.11.2026): ранний `return owners` при одном владельце
+  // выходил ДО фильтра, поэтому на 2 игроках единственный защищённый соперник проходил
+  // автоподбор: предпроверка отвечала «можно», а collectSide честно отказывал — карта в UI
+  // выглядела играбельной, ход не проходил. Теперь единственный владелец проходит тот же
+  // swapEligibleOwners, что и группа: нет подходящей и таргетируемой карты — [].
+  const sourceId = (ctx as any).currentSourceId as string | undefined;
+  const raw = sourceId && (ctx as any).selectedPlayers ? (ctx as any).selectedPlayers[sourceId] : undefined;
+  const pid = Array.isArray(raw) ? raw[0] : raw;
+  if (pid) {
+    // N-1 (07.11.2026): явно выбранный соперник возвращался ДО фильтра, поэтому защищённый
+    // (cannot_be_targeted) проходил предпроверку isActionPossible, а collectSide в исполнении
+    // честно отказывал: карта в UI играбельна, ход не проходит — тот же класс, что #34/#35.
+    // Теперь явный выбор идёт через swapEligibleOwners: фильтр живёт в одном месте,
+    // нет подходящей и таргетируемой карты — отказ [].
+    const hit = owners.find(o => o.id === String(pid));
+    if (!hit) return [];
+    return swapEligibleOwners(ctx, [hit], selector, actorId);
+  }
+  const withCards = swapEligibleOwners(ctx, owners, selector, actorId);
+  if (withCards.length === 1) return withCards;
+  if (withCards.length === 0) return [];
+  return undefined;
+}
+
+// D6: сколько подходящих карт у заданных владельцев — для предпроверки стороны swap.
+function countTargetsForOwners(ctx: ResolveContext, owners: PlayerState[], selector?: TargetSelector): number {
+  if (!selector || !Array.isArray(owners)) return 0;
+  const zone = (selector as any).zone as any;
+  const filter = (selector as any)?.filters;
+  const sourceId = (ctx as any).currentSourceId as string | undefined;
+  let total = 0;
+  for (const o of owners) {
+    const arr = getZoneArrayWithShared(ctx, o, zone);
+    for (const id of arr) if (matchesFilter(ctx.state.cards[id] as any, filter, sourceId)) total++;
+  }
+  return total;
+}
+
+// BUG-SWAP-05-follow-up (07.11.2026): на вопрос «у кого есть карта для обмена» сервис и движок
+// обязаны отвечать одинаково. Раньше swapChoiceRequirement (gameService) считал кандидатом любого
+// соперника с непустой зоной, а движок — только того, у кого карта проходит matchesFilter:
+// окно выбора открывалось на соперника без подходящих карт, выбор проходил guard, исполнитель
+// отказывал, и транспорт отдавал 409 уже в открытое окно. Фильтр живёт только здесь.
+function swapEligibleOwners(
+  ctx: ResolveContext,
+  owners: PlayerState[],
+  selector: TargetSelector | undefined,
+  actorId?: string,
+): PlayerState[] {
+  if (!selector || !Array.isArray(owners)) return [];
+  // matchesFilter — половина ответа: collectSide в ветви исполнения применяет ещё
+  // isTargetableFor, поэтому соперник с одними cannot_be_targeted обменять не сможет.
+  // Актора передают оба пути: сервисный swapCandidatesFor и автоподбор swapOpponentCandidates.
+  const zone = (selector as any).zone as any;
+  const filter = (selector as any)?.filters;
+  const sourceId = (ctx as any).currentSourceId as string | undefined;
+  return owners.filter(o => {
+    if (countTargetsForOwners(ctx, [o], selector) <= 0) return false;
+    if (!actorId) return true;
+    const arr = getZoneArrayWithShared(ctx, o, zone);
+    return arr.some((id) => matchesFilter(ctx.state.cards[id] as any, filter, sourceId)
+      && isTargetableFor('swap', ctx.state.cards[id] as any, actorId, o.id, ctx.state));
+  });
+}
+
+// Кандидаты стороны обмена для транспорта (окно выбора соперника). Возвращает ровно тех,
+// кого выберет исполнитель: один и тот же селектор стороны B и тот же matchesFilter.
+export function swapCandidatesFor(state: GameState, playerId: string, action: any): string[] {
+  const player = state.players.find(p => p.id === playerId);
+  if (!player) return [];
+  const selector = swapSelectors(action).b;
+  if (!selector) return [];
+  // countTargetsForOwners читает только ctx.state — шина событий здесь не нужна
+  const ctx = { state } as unknown as ResolveContext;
+  const owners = state.players.filter(p => p.id !== playerId);
+  return swapEligibleOwners(ctx, owners, selector, playerId).map(o => o.id);
+}
+
+// D6: сколько карт участвует в обмене. quantity.value есть у dirty_deal_spell (99 — «всеми картами»),
+// без него — одна карта, как в легаси-диалекте.
+function swapQuantity(action: any, a?: TargetSelector, b?: TargetSelector): number {
+  const rawQ = (a as any)?.quantity?.value ?? (b as any)?.quantity?.value ?? action?.quantity?.value;
+  const n = Number(rawQ);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+export async function resolveEffect(ctx: ResolveContext, player: PlayerState, sourceCardId: string, effect: Effect): Promise<ResolutionResult> {
+  // Respect minimal metadata on Effect: while_source_in (skip if source not in zone)
+  const effAny = effect as any;
+  if (effAny.while_source_in) {
+    const zone = effAny.while_source_in as any;
+    let found = false;
+    for (const p of ctx.state.players) {
+      const arr = getZoneArrayWithShared(ctx, p, zone);
+      if (arr.includes(sourceCardId)) { found = true; break; }
+    }
+    if (!found) return { success: true };
+  }
+  // Prevent: если для данного sourceCardId выставлен prevent — пропускаем весь эффект
+  if ((ctx as any).preventEffects && (ctx as any).preventEffects[sourceCardId]) {
+    return { success: true };
+  }
+  // For now: evaluate actions in order, honoring requires_success_of_previous and skipping impossible actions
+  let prevSucceeded = true;
+  (ctx as any).currentSourceId = sourceCardId;
+  // В6-2a/scope: собрать неразобранные селекторы до исполнения, чтобы список попал в отчёт
+  reportScopeUnresolved(ctx, player, sourceCardId, effect.actions as any[]);
+  for (const action of effect.actions) {
+    normalizeActionTargets(action as any);
+    // getScopePlayers должен знать kind: неисполнимый kind — не баг scope, и путать их нельзя
+    (ctx as any).currentActionKind = (action as any).kind;
+    if (action.requires_success_of_previous && !prevSucceeded) {
+      continue;
+    }
+    const possible = isActionPossible(ctx, player, action);
+    if (!possible) {
+      // Impossible actions are skipped per wiki logic
+      ctx.bus.emit({ type: 'action_resolved', action, success: false });
+      prevSucceeded = false;
+      continue;
+    }
+    const ok = await executeAction(ctx, player, action);
+    ctx.bus.emit({ type: 'action_resolved', action, success: ok });
+    prevSucceeded = ok;
+  }
+  // В6-3a-2: единая точка публикации следа пропущенных optional — сюда попадают все kind,
+  // включая те, что ещё не пишут пропуски (flush пустого набора ничего не делает).
+  publishOptionalSkipped(ctx);
+  return { success: true };
+}
+
+/** Execute a raw array of actions (e.g., costs) with feasibility checks. Returns true if all feasible actions executed (non-feasible are treated as failures). */
+export async function resolveActions(ctx: ResolveContext, player: PlayerState, actions: Action[]): Promise<boolean> {
+  let allOk = true;
+  // В6-2a/scope: прямые вызовы resolveActions тоже обязаны наполнять unresolved, иначе отказ немой
+  reportScopeUnresolved(ctx, player, (ctx as any).currentSourceId || '', actions as any[]);
+  for (const action of actions) {
+    normalizeActionTargets(action as any);
+    (ctx as any).currentActionKind = (action as any).kind;
+    const possible = isActionPossible(ctx, player, action);
+    if (!possible) {
+      ctx.bus.emit({ type: 'action_resolved', action, success: false });
+      allOk = false;
+      continue;
+    }
+    const ok = await executeAction(ctx, player, action);
+    ctx.bus.emit({ type: 'action_resolved', action, success: ok });
+    if (!ok) allOk = false;
+  }
+  // В6-3a-2: прямые вызовы resolveActions (стоимости, триггеры) тоже публикуют пропуски.
+  publishOptionalSkipped(ctx);
+  return allOk;
+}
+
+// Виды pull / force_discard / return_to_hand отсутствуют в union ActionKind (shared/src/types.ts),
+// поэтому диспетчеризуются до switch по приведению типа — тем же приёмом, что и 'draw'.
+// Виды choice и counter не реализуются: counter уже покрыт окнами реакций (Neigh/Super Neigh/
+// Rewind/Objection в gameService.ts), choice требует UI await_choice (решение Аналитика от 30.10.2026).
+
+function randomIndex(len: number): number {
+  return Math.floor(Math.random() * len);
+}
+
+// pull: 1 случайная карта из руки выбранного соперника в руку владельца. Пустая рука — false без мутаций.
+function executePull(ctx: ResolveContext, player: PlayerState): boolean {
+  const sourceId = (ctx as any).currentSourceId as string | undefined;
+  const sel = sourceId && (ctx as any).selectedPlayers ? (ctx as any).selectedPlayers[sourceId] : undefined;
+  const chosenId = Array.isArray(sel) ? sel[0] : sel;
+  const target = (chosenId && ctx.state.players.find(p => p.id === chosenId && p.id !== player.id))
+    || ctx.state.players.find(p => p.id !== player.id && p.hand.length > 0);
+  if (!target || target.hand.length === 0) return false;
+  const [cardId] = target.hand.splice(randomIndex(target.hand.length), 1);
+  player.hand.push(cardId);
+  return true;
+}
+
+// force_discard: до quantity других игроков сбрасывают по одной случайной карте из руки (Puppetmaster Unicorn).
+// done — защитники, которые уже сбросили карту в этой цепочке (для продолжения после окна).
+export function executeForceDiscard(ctx: ResolveContext, player: PlayerState, quantity: number, done: string[] = []): boolean {
+  let forced = 0;
+  const forcedIds: string[] = [...done];
+  for (const other of ctx.state.players) {
+    if (forced >= quantity) break;
+    if (other.id === player.id || other.hand.length === 0 || forcedIds.includes(other.id)) continue;
+    // Защитник с 2+ картами выбирает сам: открываем окно await_choice и выходим до мутации руки.
+    if (other.hand.length >= 2 && ctx.requestChoice) {
+      const opened = ctx.requestChoice({
+        actorId: player.id,
+        chooserId: other.id,
+        sourceCardId: ctx.currentSourceId ?? null,
+        options: other.hand.slice(),
+        remaining: quantity - forced - 1,
+        done: forcedIds.slice(),
+      });
+      if (opened) return true;
+    }
+    // Единственная карта — выбора нет, сброс случайный, как раньше.
+    const [cardId] = other.hand.splice(randomIndex(other.hand.length), 1);
+    other.discard.push(cardId);
+    maybeInterceptMagicToHand(ctx, other, cardId);
+    forcedIds.push(other.id);
+    forced++;
+  }
+  return forced > 0;
+}
+
+// Куда уходит карта при уничтожении / жертве / возврате. Малыш (source_zone==="nursery_only")
+// всегда возвращается в общие Ясли (state.nursery), остальные — в переданный fallback (сброс или руку).
+// Малыш в руку не попадает по правилу Даниила, поэтому ветка руки для него не нужна.
+function sendCardTo(ctx: ResolveContext, owner: PlayerState, cardId: string, fallback: string[]): void {
+  const card = ctx.state.cards[cardId];
+  if (isNurseryOnly(card as any)) {
+    if (!ctx.state.nursery) ctx.state.nursery = [];
+    ctx.state.nursery.push(cardId);
+    return;
+  }
+  fallback.push(cardId);
+}
+
+// return_to_hand: вернуть Единорога из сброса владельца в руку (Zombie Knight Unicorn).
+function executeReturnToHand(ctx: ResolveContext, player: PlayerState, quantity: number): boolean {
+  const sourceId = (ctx as any).currentSourceId as string | undefined;
+  const chosen: string[] = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+  let moved = 0;
+  for (const id of chosen) {
+    if (moved >= quantity) break;
+    const idx = player.discard.lastIndexOf(id);
+    if (idx === -1) continue;
+    player.discard.splice(idx, 1);
+    sendCardTo(ctx, player, id, player.hand);
+    moved++;
+  }
+  return moved > 0;
+}
+
+// Zombie Knight Unicorn в стойле владельца.
+function ownerHasZombieKnight(ctx: ResolveContext, owner: PlayerState): boolean {
+  for (const cid of owner.stable) {
+    const c = ctx.state.cards[cid] as any;
+    const nameLower = String((c?.name || c?.Название || '')).toLowerCase();
+    if (nameLower.includes('zombie') && nameLower.includes('knight') && nameLower.includes('unicorn')) return true;
+  }
+  return false;
+}
+
+// Возврат Единорога в руку вместо сброса при sacrifice/destroy, если активен Zombie Knight.
+// Карта к этому моменту уже изъята из стойла, поэтому проверяем и саму возвращаемую карту:
+// Zombie Knight, пожертвованный сам, тоже возвращается в руку владельца.
+function zombieKnightReturn(ctx: ResolveContext, owner: PlayerState, cardId: string): void {
+  const moved = ctx.state.cards[cardId] as any;
+  // Фильтр card_group: unicorn — магия и прочие карты в сброс не перехватываются
+  if (!String(moved?.type || '').toLowerCase().includes('unicorn')) return;
+  const movedName = String((moved?.name || moved?.Название || '')).toLowerCase();
+  const isSelfZombie = movedName.includes('zombie') && movedName.includes('knight') && movedName.includes('unicorn');
+  if (!isSelfZombie && !ownerHasZombieKnight(ctx, owner)) return;
+  const idx = owner.discard.lastIndexOf(cardId);
+  if (idx === -1) return;
+  owner.discard.splice(idx, 1);
+  owner.hand.push(cardId);
+}
+
+// В6-3a/3-A: получатели добора по target_player каталога (self | others | all | chosen).
+// Отдельный резолвер, а НЕ getScopePlayers: там нет 'others' и 'all', они падают в default → [],
+// и через него md 127 дал бы ноль получателей — тест «p1=7, p2=0» позеленел бы ложно.
+// chosen без выбранного игрока — fail loud ([]), никакого «по умолчанию себе».
+export function drawRecipients(ctx: ResolveContext, player: PlayerState, targetPlayer: string): PlayerState[] {
+  switch (String(targetPlayer || 'self')) {
+    case 'self':
+      return [player];
+    case 'others':
+      return ctx.state.players.filter(p => p.id !== player.id);
+    case 'all':
+      return ctx.state.players;
+    case 'chosen': {
+      const raw = ctx.selectedPlayers ? (ctx.selectedPlayers as any)[(ctx as any).currentSourceId || ''] : undefined;
+      const chosenId = Array.isArray(raw) ? raw[0] : raw;
+      if (!chosenId) return [];
+      const target = ctx.state.players.find(p => p.id === chosenId);
+      return target ? [target] : [];
+    }
+    default:
+      return [];
+  }
+}
+
+// В6-3a-2: перенос накопленного ctx.optionalSkipped в состояние партии.
+// ctx живёт только внутри одного вызова resolveEffect (ctxFor создаёт новый объект),
+// поэтому без публикации пропуск терялся: клиент видел «ничего не произошло» без причины.
+// Пишем в state.optionalSkipped с меткой времени. Копится за партию и на смене хода не чистится
+// (см. state.ts про optionalSkipped): игрок должен видеть пропуск и на следующем ходу.
+function publishOptionalSkipped(ctx: ResolveContext): void {
+  const skipped = ctx.optionalSkipped;
+  if (!Array.isArray(skipped) || skipped.length === 0) return;
+  // ctx.optionalSkipped не чистим: его читают тесты и вызывающий код. Вместо этого помним,
+  // сколько записей уже опубликовано — повторный flush одного ctx не даёт дублей в состоянии.
+  const c = ctx as any;
+  const from = Number(c.optionalSkippedPublished ?? 0);
+  const state = ctx.state as any;
+  if (!Array.isArray(state.optionalSkipped)) state.optionalSkipped = [];
+  for (let i = from; i < skipped.length; i++) {
+    const rec = skipped[i];
+    state.optionalSkipped.push({
+      cardId: String(rec.cardId || ''),
+      kind: String(rec.kind || ''),
+      targetPlayer: String(rec.targetPlayer || 'self'),
+      playerId: String(rec.playerId || ''),
+      quantity: Number(rec.quantity ?? 0),
+      t: Date.now(),
+    });
+  }
+  c.optionalSkippedPublished = skipped.length;
+}
+
+// В6-3a/3-A: добор N карт из колоды получателям по target_player.
+// optional draw чужому игроку не исполняется без его согласия (окна выбора в этом диффе нет),
+// но каждый пропуск пишется в ctx.optionalSkipped — молча пропускать нельзя.
+// Решафл сброса при пустой колоде — отдельная задача со своими тестами.
+async function executeDraw(ctx: ResolveContext, player: PlayerState, action: any): Promise<boolean> {
+  const quantity = Number(action?.targets?.quantity?.value ?? 1);
+  if (!Number.isFinite(quantity) || quantity <= 0) return false;
+  const targetPlayer = String(action?.target_player || 'self');
+  const isOptional = action?.optional === true;
+  const recipients = drawRecipients(ctx, player, targetPlayer);
+  const noteSkip = (playerId: string): void => {
+    ctx.optionalSkipped = Array.isArray(ctx.optionalSkipped) ? ctx.optionalSkipped : [];
+    ctx.optionalSkipped.push({
+      cardId: String((ctx as any).currentSourceId || ''),
+      kind: 'draw',
+      targetPlayer,
+      playerId,
+      quantity: Math.floor(quantity),
+    });
+  };
+  if (recipients.length === 0) {
+    // Неизвестный target_player или chosen без выбора: не исполняем и не подменяем на себя.
+    noteSkip('');
+    return false;
+  }
+  let drawn = 0;
+  for (const owner of recipients) {
+    if (isOptional && owner.id !== player.id) { noteSkip(owner.id); continue; }
+    const deckArr = getZoneArrayWithShared(ctx, owner, 'deck');
+    if (!Array.isArray(deckArr)) continue;
+    for (let i = 0; i < quantity; i++) {
+      const cardId = deckArr.pop(); // верх колоды — конец массива, как и в 'add'
+      if (!cardId) break;
+      owner.hand.push(cardId);
+      drawn++;
+    }
+  }
+  maybeEndOnDeckEmpty(ctx);
+  return drawn > 0;
+}
+
+async function executeAction(ctx: ResolveContext, player: PlayerState, action: Action): Promise<boolean> {
+  // Добор карт (DRAW N). Вид 'draw' есть в базе карт (Ancient Ritual, Archangel Unicorn,
+  // Sentinel Unicorn), но отсутствует в union ActionKind в shared/src/types.ts, поэтому
+  // обрабатываем до switch по приведению типа — общий контракт не расширяем без согласования.
+  const extraKind = String((action as any)?.kind);
+  normalizeActionTargets(action as any); // Б1: те же .target/.targets, вход в executeAction
+  if (extraKind === 'pull') return executePull(ctx, player);
+  if (extraKind === 'force_discard' || extraKind === 'return_to_hand') {
+    const q = Number((action as any)?.targets?.quantity?.value ?? 1);
+    const qty = Number.isFinite(q) && q > 0 ? q : 1;
+    return extraKind === 'force_discard'
+      ? executeForceDiscard(ctx, player, qty)
+      : executeReturnToHand(ctx, player, qty);
+  }
+  // В6-3a/3-A: добор вынесен в executeDraw. Получателей решает drawRecipients по target_player:
+  // раньше добор всегда шёл в player.hand, а target_player игнорировался (md 70/92/105/126/127).
+  if (String((action as any)?.kind) === 'draw') {
+    return executeDraw(ctx, player, action as any);
+  }
+  switch (action.kind) {
+    case 'destroy': {
+      // Destroy targets from selector.targets; require explicit selection if available
+      const sel = (action as any).targets as TargetSelector;
+      const qtyBase = (sel as any)?.quantity?.value ?? 1;
+      const zone = (sel as any).zone as any;
+      const group = (sel as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      let qty = qtyBase;
+      // Apply simple bonus: Epic Level Unicorn allows +1 destroy
+      if (hasDoubleDestroyBonus(ctx, player)) qty = qtyBase + 1;
+      // Determine permissible owners to destroy from (respect scope; default opponents)
+      // В6-2a/scope: раньше строка ниже выкидывала себя ВСЕГДА, поэтому destroy со scope 'any'
+      // не мог выбрать свою карту даже после починки scope. Для hostile-действий без явного
+      // wide-scope поведение прежнее: по умолчанию — только соперники.
+      let owners = getScopePlayers(ctx, player, sel);
+      const scopeRaw = (sel as any)?.scope;
+      const scopeWide = scopeRaw === 'any' || scopeRaw === 'any_player' || scopeRaw === 'all_players';
+      if (scopeRaw === 'self') {
+        // scope 'self' — владелец ровно один и это сам игрок; отсев себя здесь был бы ошибкой
+        owners = owners.filter(p => p.id === player.id);
+      } else if (!scopeWide) {
+        owners = owners.filter(p => p.id !== player.id);
+      }
+      let paused = false; // окно замены открыто: остальные цели не трогаем
+      const performDestroy = async (owner: PlayerState, id: string): Promise<boolean> => {
+        const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+        const idx = srcArr.indexOf(id);
+        if (idx === -1) return false;
+        const card = ctx.state.cards[id];
+        if (!matchesFilter(card as any, (sel as any).filters, (ctx as any).currentSourceId as string | undefined)) return false;
+        if (!isTargetableFor('destroy', card as any, player.id, owner.id, ctx.state)) return false;
+
+        // Archangel Unicorn (данные, optional): замена — выбор владельца; до ответа карта не мутирует
+        const rep = resolveDestroyReplacement(ctx, player, owner, zone, id, 'destroy');
+        if (rep === 'open') { paused = true; return false; }
+        if (rep === 'blocked') return false;
+        srcArr.splice(idx, 1);
+        sendCardTo(ctx, owner, id, owner.discard);
+        zombieKnightReturn(ctx, owner, id);
+        // Mystic Rainbow Unicorn: перехват магии из сброса
+        maybeInterceptMagicToHand(ctx, owner, id);
+        // Trigger when_destroyed for owner
+        await triggerDestroyedEffectsFor(ctx, owner, id);
+        return true;
+      };
+      let destroyed = 0;
+      // Use explicit choices first
+      for (const id of (chosen || []).slice(0, qty)) {
+        const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
+        if (!owner) continue;
+        if (paused) break;
+        const ok = await performDestroy(owner, id);
+        if (ok) destroyed++;
+        if (destroyed >= qty) break;
+      }
+      // Auto-pick remaining eligible targets from the end
+      if (destroyed < qty) {
+        outerD: for (const owner of owners) {
+          const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+          for (let i = srcArr.length - 1; i >= 0 && destroyed < qty; i--) {
+            const cand = srcArr[i];
+            const card = ctx.state.cards[cand];
+            const ignored = sourceId && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId] && (ctx as any).ignoreTargets[sourceId].includes(cand);
+            if (ignored) continue;
+            if (!matchesFilter(card as any, (sel as any).filters, (ctx as any).currentSourceId as string | undefined)) continue;
+            if (paused) break outerD;
+            const ok = await performDestroy(owner, cand);
+            if (ok) destroyed++;
+          }
+          if (destroyed >= qty) break outerD;
+        }
+      }
+      return destroyed > 0;
+    }
+    case 'add': {
+      // Example: draw -> move from deck to hand
+      const quantity = action.quantity?.value ?? 1;
+      const from = action.source;
+      const to = action.destination;
+      const srcArr = getZoneArrayWithShared(ctx, player, from);
+      const dstArr = getZoneArrayWithShared(ctx, player, to);
+      let moved = 0;
+      for (let i = 0; i < quantity; i++) {
+        const cardId = srcArr.pop(); // from top
+        if (!cardId) break;
+        dstArr.push(cardId);
+        moved++;
+      }
+      // End game if shared deck exhausted
+      if (action.source === 'deck') maybeEndOnDeckEmpty(ctx);
+      return moved > 0;
+    }
+    case 'discard': {
+      // discard selected cards from a zone (typically hand) to discard pile
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (sel as any).quantity?.value ?? 1;
+      const zone = (sel as any).zone as any;
+      const chosen = ((ctx as any).currentSourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[(ctx as any).currentSourceId]) || [];
+      const srcArr = getZoneArrayWithShared(ctx, player, zone);
+      let count = 0;
+      for (const id of (chosen || []).slice(0, qty)) {
+        const idx = srcArr.indexOf(id);
+        if (idx === -1) continue;
+        srcArr.splice(idx, 1);
+        player.discard.push(id);
+        count++;
+      }
+      while (count < qty && srcArr.length > 0) {
+        const id = srcArr.pop();
+        if (!id) break;
+        player.discard.push(id);
+        count++;
+      }
+      return count >= qty;
+    }
+    case 'sacrifice': {
+      // move selected cards from player's stable (or specified zone) to discard
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (sel as any).quantity?.value ?? 1;
+      const zone = (sel as any).zone as any;
+      const group = (sel as any)?.filters?.card_group;
+      const chosen = ((ctx as any).currentSourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[(ctx as any).currentSourceId]) || [];
+      const owners = getScopePlayers(ctx, player, sel); // scope: any — все владельцы, self — актор
+      let moved = 0;
+      let paused = false; // окно замены открыто: остальные жертвы не трогаем
+      // Квота жертвы считается НА ВЛАДЕЛЬЦА: иначе второй игрок не доживает до своей жертвы.
+      const movedBy = new Map<string, number>();
+      for (const id of (chosen || []).slice(0, qty)) {
+        const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
+        if (!owner) continue;
+        const card = ctx.state.cards[id];
+        if (!matchesFilter(card as any, (sel as any).filters, (ctx as any).currentSourceId as string | undefined)) continue;
+        // Аура маски: маскированного единорога нельзя пожертвовать (ни себе, ни сопернику)
+        if (!isTargetableFor('sacrifice', card as any, player.id, owner.id, ctx.state)) continue;
+        const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+        const idx = srcArr.indexOf(id);
+        if (idx === -1) continue;
+        // Archangel Unicorn (данные, optional): замена жертвы — выбор владельца, до ответа не мутирует
+        const rep = resolveDestroyReplacement(ctx, player, owner, zone, id, 'sacrifice');
+        if (rep === 'open') { paused = true; break; }
+        if (rep === 'blocked') continue;
+        srcArr.splice(idx, 1);
+        sendCardTo(ctx, owner, id, owner.discard);
+        zombieKnightReturn(ctx, owner, id);
+        moved++;
+        movedBy.set(owner.id, (movedBy.get(owner.id) || 0) + 1);
+      }
+      for (const owner of owners) {
+        const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+        // Пропущенные карты (фильтр / маска) не теряем: откладываем и возвращаем на место в исходном порядке.
+        const skipped: string[] = [];
+        while (!paused && (movedBy.get(owner.id) || 0) < qty && srcArr.length > 0) {
+          const id = srcArr[srcArr.length - 1];
+          const card = ctx.state.cards[id];
+          if (!matchesFilter(card as any, (sel as any).filters, (ctx as any).currentSourceId as string | undefined) || !isTargetableFor('sacrifice', card as any, player.id, owner.id, ctx.state)) {
+            // Аура маски: маскированный единорог не жертвуется даже автопрохождением
+            srcArr.pop();
+            skipped.unshift(id);
+            continue;
+          }
+          // Archangel Unicorn (данные, optional): замена через окно владельца
+          const rep2 = resolveDestroyReplacement(ctx, player, owner, zone, id, 'sacrifice');
+          if (rep2 === 'open') { paused = true; break; }
+          if (rep2 === 'blocked') { srcArr.pop(); skipped.unshift(id); continue; }
+          srcArr.pop();
+          sendCardTo(ctx, owner, id, owner.discard);
+          zombieKnightReturn(ctx, owner, id);
+          moved++;
+          movedBy.set(owner.id, (movedBy.get(owner.id) || 0) + 1);
+        }
+        // Вернуть пропущенные в конец массива (верх стойла) в исходном порядке
+        for (const sid of skipped) srcArr.push(sid);
+      }
+      return moved > 0;
+    }
+    case 'move': {
+      // Move from selector.from to selector.to; поддерживаем явный выбор по ctx.selectedTargets[currentSourceId]
+      const from = actionSelector(action as any) as TargetSelector;
+      const to = (actionDestination(action as any) ?? { scope: 'self', zone: 'stable' }) as {
+        scope: 'self' | 'opponent' | 'any_player';
+        zone: any;
+      };
+      const qty = (from as any).quantity?.value ?? 1;
+      const group = (from as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      let moved = 0;
+      // Функция определения владельца назначения
+      const resolveDestOwner = (): PlayerState => {
+        if (to.scope === 'self') return player;
+        if (to.scope === 'opponent' || to.scope === 'any_player') {
+          const selP = sourceId && (ctx as any).selectedPlayers && (ctx as any).selectedPlayers[sourceId];
+          const targetPid = Array.isArray(selP) ? selP[0] : selP;
+          const candidate = targetPid ? ctx.state.players.find(pp => pp.id === targetPid) : undefined;
+          return candidate || player;
+        }
+        return player;
+      };
+      const destOwner = resolveDestOwner();
+      const dstArr = getZoneArrayWithShared(ctx, destOwner, (to as any).zone as any);
+      if (Array.isArray(chosen) && chosen.length >= qty) {
+        // Явный выбор: переносим ровно выбранные карты из допустимых владельцев согласно scope
+        // Разрешённые владельцы-источники
+        let owners = getScopePlayers(ctx, player, from);
+        const zone = (from as any).zone as any;
+        for (const id of chosen.slice(0, qty)) {
+          // ignoreTargets для source
+          const sourceId = (ctx as any).currentSourceId as string | undefined;
+          const ignored = sourceId && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId] && (ctx as any).ignoreTargets[sourceId].includes(id);
+          if (ignored) continue;
+          const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
+          if (!owner) continue;
+          const card = ctx.state.cards[id];
+          if (!matchesCardGroup(card as any, group)) continue;
+          if (!isTargetableFor('move', card, player.id, owner.id, ctx.state)) continue;
+          const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+          const idx = srcArr.indexOf(id);
+          if (idx === -1) continue;
+          srcArr.splice(idx, 1);
+          dstArr.push(id);
+          // Триггерим входные эффекты при необходимости
+          const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+          if (enterMode === 'as_on_play' && ((to as any).zone as any) === 'stable') {
+            await triggerEnterEffectsFor(ctx, destOwner, id);
+          }
+          moved++;
+        }
+      }
+      // Фоллбек: если выбор не был предоставлен — переносим верхние карты (как раньше)
+      if (moved < qty) {
+        const scopePlayers = getScopePlayers(ctx, player, from);
+        for (const p of scopePlayers) {
+          const srcArr = getZoneArrayWithShared(ctx, p, (from as any).zone as any);
+          for (let i = 0; i < qty - moved; i++) {
+            // снять верхнюю, проверив фильтр
+            let cardId: string | undefined = undefined;
+            while (srcArr.length > 0) {
+              const cand = srcArr[srcArr.length - 1];
+              const candCard = ctx.state.cards[cand];
+              const sourceId = (ctx as any).currentSourceId as string | undefined;
+              const ignored = sourceId && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId] && (ctx as any).ignoreTargets[sourceId].includes(cand);
+              if (matchesCardGroup(candCard as any, group) && !ignored && isTargetableFor('move', candCard as any, player.id, p.id, ctx.state)) { cardId = srcArr.pop(); break; }
+              else { srcArr.pop(); }
+            }
+            if (!cardId) break;
+            dstArr.push(cardId);
+            const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+            if (enterMode === 'as_on_play' && ((to as any).zone as any) === 'stable') {
+              await triggerEnterEffectsFor(ctx, destOwner, cardId);
+            }
+            moved++;
+          }
+          if (moved > 0) break;
+        }
+      }
+      if ((from as any).zone === 'deck') maybeEndOnDeckEmpty(ctx);
+      return moved > 0;
+    }
+    case 'give':
+    case 'return':
+    case 'transfer': {
+      // Поведение аналогично 'move'; различия задаются селекторами from/to на уровне данных
+      const from = actionSelector(action as any) as TargetSelector;
+      const to = actionDestination(action as any) as
+        | { scope: 'self' | 'opponent' | 'any_player'; zone: any }
+        | undefined;
+      const qty = (from as any).quantity?.value ?? 1;
+      const group = (from as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      let moved = 0;
+      const zone = (from as any).zone as any;
+      const owners = getScopePlayers(ctx, player, from);
+      const resolveDestOwner = (): PlayerState => {
+        if (!to) return player;
+        if (to.scope === 'self') return player;
+        const selP = sourceId && (ctx as any).selectedPlayers && (ctx as any).selectedPlayers[sourceId];
+        const targetPid = Array.isArray(selP) ? selP[0] : selP;
+        const candidate = targetPid ? ctx.state.players.find(pp => pp.id === targetPid) : undefined;
+        return candidate || player;
+      };
+      const destOwner = resolveDestOwner();
+      const destZone = (to as any)?.zone ?? 'stable';
+      const dstArr = getZoneArrayWithShared(ctx, destOwner, destZone);
+      // Явный выбор в приоритете
+      for (const id of (chosen || []).slice(0, qty)) {
+        const sourceId2 = (ctx as any).currentSourceId as string | undefined;
+        const ignored = sourceId2 && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId2] && (ctx as any).ignoreTargets[sourceId2].includes(id);
+        if (ignored) continue;
+        const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
+        if (!owner) continue;
+        const card = ctx.state.cards[id];
+        if (!matchesCardGroup(card as any, group)) continue;
+        if (!isTargetableFor(String(action.kind), card, player.id, owner.id, ctx.state)) continue;
+        // Малыш достаётся только из Яслей (pull/steal/move/search из колоды или сброса его не берут)
+        if (!isCardAvailableFromZone(card as any, zone)) continue;
+        const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+        const idx = srcArr.indexOf(id);
+        if (idx === -1) continue;
+        srcArr.splice(idx, 1);
+        dstArr.push(id);
+        const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+        if (enterMode === 'as_on_play' && destZone === 'stable') {
+          await triggerEnterEffectsFor(ctx, destOwner, id);
+        }
+        moved++;
+      }
+      // Фоллбек автопереноса
+      if (moved < qty) {
+        outer2: for (const owner of owners) {
+          const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+          for (let i = srcArr.length - 1; i >= 0 && moved < qty; i--) {
+            const cand = srcArr[i];
+            const card = ctx.state.cards[cand];
+            const sourceId2 = (ctx as any).currentSourceId as string | undefined;
+            const ignored = sourceId2 && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId2] && (ctx as any).ignoreTargets[sourceId2].includes(cand);
+            if (!matchesCardGroup(card as any, group) || ignored) continue;
+            if (!isTargetableFor(String(action.kind), card, player.id, owner.id, ctx.state)) continue;
+            if (!isCardAvailableFromZone(card as any, zone)) continue;
+            srcArr.splice(i, 1);
+            dstArr.push(cand);
+            const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+            if (enterMode === 'as_on_play' && destZone === 'stable') {
+              await triggerEnterEffectsFor(ctx, destOwner, cand);
+            }
+            moved++;
+            if (moved >= qty) break outer2;
+          }
+        }
+      }
+      if ((from as any).zone === 'deck') maybeEndOnDeckEmpty(ctx);
+      return moved > 0;
+    }
+    case 'swap': {
+      // D6/BUG-SWAP-02: обмен наборами карт между сторонами A и B.
+      // Каталог v2 даёт ОДИН селектор (.target с quantity.value) + .destination/.destination_player;
+      // легаси-диалект — явные .a/.b. Сторона B при широком scope больше не включает актора:
+      // иначе обмен схлопывался в собственную руку (перестановка своих же карт) и возвращал true.
+      // quantity.value читается: dirty_deal_spell («Поменяйтесь всеми картами на руке») даёт 99,
+      // то есть меняются наборы целиком, а не по одной карте.
+      const { a: aSel, b: bSel } = swapSelectors(action as any);
+      if (!aSel || !bSel) return false;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const qty = swapQuantity(action as any, aSel, bSel);
+      const aOwners = swapSideOwners(ctx, player, aSel, false);
+      const bOwnersRaw = swapSideOwners(ctx, player, bSel, true);
+      // BUG-SWAP-03: сторона B — ровно один соперник, тем же разбором, что и в предпроверке.
+      const resolvedB = swapOpponentCandidates(ctx, bOwnersRaw, bSel, player.id);
+      if (!resolvedB || resolvedB.length === 0) return false;
+      const bOwners = resolvedB;
+      const ignoreList = (sourceId && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId]) || [];
+      // Одна запись = одна карта в конкретном массиве зоны конкретного владельца.
+      type SwapEntry = { owner: PlayerState; arr: string[]; id: string };
+      const collectSide = (owners: PlayerState[], sel: TargetSelector, limit: number, skip: Set<string>): SwapEntry[] => {
+        const zone = (sel as any).zone as any;
+        const filter = (sel as any)?.filters;
+        const out: SwapEntry[] = [];
+        for (const o of owners) {
+          const arr = getZoneArrayWithShared(ctx, o, zone);
+          for (let i = arr.length - 1; i >= 0 && out.length < limit; i--) {
+            const id = arr[i];
+            if (skip.has(id)) continue;
+            if (ignoreList.includes(id)) continue;
+            const card = ctx.state.cards[id];
+            if (!matchesFilter(card as any, filter, sourceId)) continue;
+            if (!isTargetableFor('swap', card as any, player.id, o.id, ctx.state)) continue;
+            out.push({ owner: o, arr, id });
+          }
+        }
+        return out;
+      };
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      let aEntries: SwapEntry[];
+      let bEntries: SwapEntry[];
+      if (Array.isArray(chosen) && chosen.length >= 2 && chosen[0] && chosen[1]) {
+        // Явный выбор игрока: ровно по одной карте с каждой стороны и только из её владельцев.
+        aEntries = collectSide(aOwners, aSel, Number.MAX_SAFE_INTEGER, new Set()).filter(e => e.id === chosen[0]).slice(0, 1);
+        bEntries = collectSide(bOwners, bSel, Number.MAX_SAFE_INTEGER, new Set()).filter(e => e.id === chosen[1]).slice(0, 1);
+      } else {
+        aEntries = collectSide(aOwners, aSel, qty, new Set());
+        bEntries = collectSide(bOwners, bSel, qty, new Set(aEntries.map(e => e.id)));
+      }
+      // Автоподбор делает collectSide выше — по тем же фильтрам и с тем же учётом ignoreTargets,
+      // иммунитетов и таргетируемости, что и явный выбор.
+      // Менять нечего — честный false без мутаций зон (второй случай «успеха без эффекта» закрыт).
+      if (aEntries.length === 0 || bEntries.length === 0) return false;
+      const aIds = aEntries.map(e => e.id);
+      const bIds = bEntries.map(e => e.id);
+      if (aIds.some(id => bIds.includes(id))) return false;
+      // Обе стороны в одном и том же массиве (своя зона сама с собой) — это перестановка, не обмен.
+      const aArrs = Array.from(new Set(aEntries.map(e => e.arr)));
+      const bArrs = Array.from(new Set(bEntries.map(e => e.arr)));
+      if (aArrs.length === 1 && bArrs.length === 1 && aArrs[0] === bArrs[0]) return false;
+      // Владельцы и зоны уже известны из collectSide — повторный resolveOwnerOf не нужен.
+      // Снимаем обе стороны (индексы запоминаем до снятия), затем вкладываем снятые наборы на их
+      // место: так обмен корректен и для наборов, и когда руки разного размера.
+      const takeOut = (entries: SwapEntry[]): { arr: string[]; index: number; ids: string[] }[] => {
+        const byArr: [string[], string[]][] = [];
+        for (const e of entries) {
+          const hit = byArr.find(([arr]) => arr === e.arr);
+          if (hit) hit[1].push(e.id);
+          else byArr.push([e.arr, [e.id]]);
+        }
+        const slots: { arr: string[]; index: number; ids: string[] }[] = [];
+        for (const [arr, ids] of byArr) {
+          const found = ids.map(id => arr.indexOf(id));
+          if (found.some(i => i < 0)) return [];
+          const index = Math.min(...found);
+          for (const id of ids) arr.splice(arr.indexOf(id), 1);
+          slots.push({ arr, index: Math.min(index, arr.length), ids });
+        }
+        return slots;
+      };
+      const slotA = takeOut(aEntries);
+      const slotB = takeOut(bEntries);
+      if (slotA.length === 0 || slotB.length === 0) return false;
+      for (const s of slotA) s.arr.splice(s.index, 0, ...bIds);
+      for (const s of slotB) s.arr.splice(s.index, 0, ...aIds);
+      return true;
+    }
+    case 'reveal': {
+      // Показать выбранные (или автоматически подобранные) карты, не перемещая их
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (sel as any).quantity?.value ?? 1;
+      const filter = (sel as any)?.filters;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      const revealed: string[] = [];
+      // 1) Явный выбор
+      for (const id of (chosen || []).slice(0, qty)) {
+        // удостоверимся, что карта существует и соответствует фильтру
+        const card = ctx.state.cards[id];
+        if (!card || !matchesFilter(card as any, filter)) continue;
+        revealed.push(id);
+      }
+      // 2) Автодобор
+      if (revealed.length < qty) {
+        const owners = getScopePlayers(ctx, player, sel);
+        const zone = (sel as any).zone as any;
+        for (const o of owners) {
+          const arr = getZoneArrayWithShared(ctx, o, zone);
+          for (let i = arr.length - 1; i >= 0 && revealed.length < qty; i--) {
+            const id = arr[i];
+            const card = ctx.state.cards[id];
+            if (matchesFilter(card as any, filter)) revealed.push(id);
+          }
+          if (revealed.length >= qty) break;
+        }
+      }
+      if (!revealed.length) return false;
+      for (const id of revealed) {
+        try { (ctx.bus as any).emit({ type: 'reveal', cardId: id, to: player.id }); } catch {}
+      }
+      return true;
+    }
+    case 'steal': {
+      // Require explicit selection: ids come from ctx.selectedTargets[currentSourceId]
+      const from = actionSelector(action as any) as TargetSelector;
+      const to = actionDestination(action as any) as TargetSelector | undefined;
+      const qty = (from as any)?.quantity?.value ?? 1;
+      const group = (from as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      // Если явный выбор не предоставлен в достаточном количестве — попробуем авто-выбор как фоллбек
+      // Determine permissible owners to steal from based on scope (default opponents)
+      let owners = getScopePlayers(ctx, player, from);
+      owners = owners.filter(p => p.id !== player.id);
+      const zone = (from as any).zone as any;
+      let moved = 0;
+      // 1) Используем явный выбор, если он есть
+      for (const id of (chosen || []).slice(0, qty)) {
+        const ignored = (ctx as any).ignoreTargets && (ctx as any).currentSourceId && (ctx as any).ignoreTargets[(ctx as any).currentSourceId]?.includes(id);
+        if (ignored) continue;
+        const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
+        if (!owner) continue;
+        const card = ctx.state.cards[id];
+        if (!matchesCardGroup(card, group)) continue;
+        if (!isTargetableFor('steal', card, player.id, owner.id, ctx.state)) continue;
+        if (!isCardAvailableFromZone(card, zone)) continue;
+        const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+        const idx = srcArr.indexOf(id);
+        if (idx === -1) continue;
+        srcArr.splice(idx, 1);
+        const destZone = (to as any)?.zone ?? 'stable';
+        // Destination owner: if a receiver is explicitly selected (e.g., via intercept), use it regardless of to.scope
+        const selP = sourceId && (ctx as any).selectedPlayers && (ctx as any).selectedPlayers[sourceId];
+        const targetPid = Array.isArray(selP) ? selP[0] : selP;
+        let destOwner: PlayerState | undefined = targetPid ? ctx.state.players.find(pp => pp.id === targetPid) : undefined;
+        if (!destOwner) {
+          // Fallback to original semantics based on to.scope
+          const toScope = (to as any)?.scope as any;
+          if (toScope === 'self') {
+            destOwner = player;
+          } else if (toScope === 'opponent' || toScope === 'any_player') {
+            // If no player was explicitly selected, default to actor's stable
+            destOwner = player;
+          } else {
+            destOwner = player;
+          }
+        }
+        const dstArr = getZoneArrayWithShared(ctx, destOwner, destZone);
+        dstArr.push(id);
+        // Trigger enter effects if requested
+        const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+        if (enterMode === 'as_on_play' && destZone === 'stable') {
+          await triggerEnterEffectsFor(ctx, destOwner, id);
+        }
+        moved++;
+      }
+      // 2) Фоллбек: если ещё не набрали нужное количество, выбираем автоматически подходящие карты
+      if (moved < qty) {
+        outer: for (const owner of owners) {
+          const srcArr = getZoneArrayWithShared(ctx, owner, zone);
+          for (let i = srcArr.length - 1; i >= 0 && moved < qty; i--) {
+            const cand = srcArr[i];
+            const card = ctx.state.cards[cand];
+            const ignored = (ctx as any).ignoreTargets && (ctx as any).currentSourceId && (ctx as any).ignoreTargets[(ctx as any).currentSourceId]?.includes(cand);
+            if (!matchesCardGroup(card, group) || ignored) continue;
+            if (!isTargetableFor('steal', card, player.id, owner.id, ctx.state)) continue;
+            if (!isCardAvailableFromZone(card, zone)) continue;
+            // снять карту
+            srcArr.splice(i, 1);
+            const destZone = (to as any)?.zone ?? 'stable';
+            // Destination owner with intercept override if present
+            const selP = sourceId && (ctx as any).selectedPlayers && (ctx as any).selectedPlayers[sourceId];
+            const targetPid = Array.isArray(selP) ? selP[0] : selP;
+            let destOwner: PlayerState | undefined = targetPid ? ctx.state.players.find(pp => pp.id === targetPid) : undefined;
+            if (!destOwner) destOwner = player;
+            const dstArr = getZoneArrayWithShared(ctx, destOwner, destZone);
+            dstArr.push(cand);
+            const enterMode = (action as any).on_enter_mode as ('as_on_play' | 'none' | undefined);
+            if (enterMode === 'as_on_play' && destZone === 'stable') {
+              await triggerEnterEffectsFor(ctx, destOwner, cand);
+            }
+            moved++;
+            if (moved >= qty) break outer;
+          }
+        }
+      }
+      return moved >= qty;
+    }
+    case 'reorder_top': {
+      // Reorder top N cards of a deck according to explicit selection order from selectedTargets[source]
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (action as any).quantity?.value ?? (sel as any).quantity?.value ?? 1;
+      // Determine target deck owner
+      const owners = getScopePlayers(ctx, player, sel);
+      const owner = owners[0] || player;
+      const deck = getZoneArrayWithShared(ctx, owner, 'deck');
+      if (!Array.isArray(deck) || deck.length === 0) return false;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      if (!Array.isArray(chosen) || chosen.length === 0) return false;
+      // Keep only cards that are currently on top segment and maintain provided order (first in chosen becomes topmost)
+      const topSegment = deck.slice(Math.max(0, deck.length - qty));
+      const order: string[] = [];
+      for (const id of chosen) { if (topSegment.includes(id)) order.push(id); }
+      if (order.length === 0) return false;
+      // Remove those ids from deck's top segment and re-append in given order
+      // First, strip any occurrence in the top segment region
+      const keepBottom = deck.slice(0, Math.max(0, deck.length - qty));
+      const segmentIds = deck.slice(Math.max(0, deck.length - qty));
+      const remaining = segmentIds.filter(id => !order.includes(id));
+      const newTop = [...remaining, ...order];
+      ctx.state.deck ? (ctx.state.deck = [...keepBottom, ...newTop]) : (owner.deck = [...keepBottom, ...newTop]);
+      return true;
+    }
+    case 'protect':
+    case 'grant_immunity': {
+      // Apply immunity flags to targeted cards
+      const sel = (action as any).targets as TargetSelector;
+      const owners = getScopePlayers(ctx, player, sel);
+      const zone = (sel as any).zone as any;
+      const group = (sel as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      let applied = 0;
+      const applyTo = (id: string) => {
+        for (const o of owners) {
+          const arr = getZoneArrayWithShared(ctx, o, zone);
+          if (!arr.includes(id)) continue;
+          const c = ctx.state.cards[id] as any;
+          if (!matchesCardGroup(c as any, group)) continue;
+          c.immune = Array.isArray(c.immune) ? c.immune : [];
+          for (const k of ((action as any).immunity_to as string[] | undefined) || []) {
+            if (!c.immune.includes(k)) c.immune.push(k);
+          }
+          applied++;
+          break;
+        }
+      };
+      for (const id of chosen) applyTo(id);
+      if (applied === 0) {
+        // fallback: apply to last matching in zone per owner
+        for (const o of owners) {
+          const arr = getZoneArrayWithShared(ctx, o, zone);
+          for (let i = arr.length - 1; i >= 0; i--) {
+            const id = arr[i];
+            const c = ctx.state.cards[id] as any;
+            if (matchesCardGroup(c as any, group)) { applyTo(id); break; }
+          }
+        }
+      }
+      return applied > 0;
+    }
+    case 'skip_phase': {
+      // Б1: пропуск фазы живёт в состоянии ХОДА, а не на карте.
+      // Раньше писали card.skip_phases - признак был вечным и никем не читался (кроме
+      // blocked_by_phase_skip в triggerTurnStartEffects, поэтому поле на карте не трогаем).
+      const phase = String((action as any).phase || '');
+      if (!phase) return false;
+      stateTurnSkip(ctx, phase);
+      return true;
+    }
+    case 'goto_end_turn': {
+      // Б1: Носорогорог - "немедленно перейдите к последней фазе".
+      // Ход НЕ передаётся: игрок сам нажимает "Завершить ход" (фаза end_turn).
+      const order = ['draw', 'play', 'action'];
+      const turn = ctx.state.turn as any;
+      turn.skippedPhases = Array.isArray(turn.skippedPhases) ? turn.skippedPhases : [];
+      for (const ph of order) {
+        if (!turn.skippedPhases.includes(ph)) turn.skippedPhases.push(ph);
+      }
+      turn.phase = 'end_turn';
+      return true;
+    }
+    case 'limit_actions': {
+      // Record per-phase action limits on player state
+      const phase = (action as any).phase as any;
+      const value = Number((action as any).value);
+      if (!Number.isFinite(value)) return false;
+      (player as any).action_limits = (player as any).action_limits || {};
+      (player as any).action_limits[phase] = value;
+      return true;
+    }
+    case 'set_flag': {
+      // В6-2a: флаг пишется по адресу, а не в общий state.flags, у которого не было читателей.
+      //   1) карта-источник — maskOfCard читает transforms_unicorn именно оттуда;
+      //   2) игрок-владелец — личные флаги (reveal_hand и подобные);
+      //   3) state.flags — оставлено для совместимости.
+      // Значение сохраняется как есть: !!value теряло имя маски ('panda' -> true).
+      const name = (action as any).name as string;
+      const rawValue = (action as any).value;
+      const flagName = typeof (action as any).flag === 'string' && (action as any).flag
+        ? String((action as any).flag)
+        : name;
+      if (!flagName) return false;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      if (sourceId && ctx.state.cards[sourceId]) {
+        const card: any = ctx.state.cards[sourceId];
+        card.flags = card.flags || {};
+        card.flags[flagName] = rawValue;
+        // Наследие: признак маски читается и с самой карты
+        if (flagName === 'transforms_unicorn') card.transforms_unicorn = rawValue;
+      }
+      if (player) {
+        (player as any).flags = (player as any).flags || {};
+        (player as any).flags[flagName] = rawValue;
+      }
+      (ctx.state as any).flags = (ctx.state as any).flags || {};
+      (ctx.state as any).flags[flagName] = rawValue;
+      return true;
+    }
+    case 'modify_win_condition': {
+      // By default, toggle counts_for_win on the source card if present
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      if (!sourceId) return false;
+      const card = ctx.state.cards[sourceId] as any;
+      const val = (action as any).counts_for_win;
+      if (typeof val === 'boolean') {
+        card.counts_for_win = val;
+        return true;
+      }
+      return false;
+    }
+    case 'discard': {
+      const sel = (action as any)?.targets as TargetSelector | undefined;
+      const qty = (sel as any).quantity?.value ?? 1;
+      const owners = getScopePlayers(ctx, player, sel);
+      let moved = 0;
+      // For costs we expect scope: self; but support owner iteration for future
+      for (const owner of owners) {
+        const hand = owner.hand;
+        const group = (sel as any)?.filters?.card_group;
+        // 1) Prefer explicit selection from ctx.selectedTargets[currentSourceId]
+        const sourceId = (ctx as any).currentSourceId as string | undefined;
+        const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+        let toDiscard: string[] = [];
+        if (Array.isArray(chosen) && chosen.length >= qty) {
+          // Validate chosen belong to owner's hand and match filter
+          for (const id of chosen.slice(0, qty)) {
+            if (!hand.includes(id)) { toDiscard = []; break; }
+            const card = ctx.state.cards[id];
+            if (!matchesCardGroup(card as any, group)) { toDiscard = []; break; }
+            toDiscard.push(id);
+          }
+        }
+        // 2) Fallback: auto-pick from end if nothing was explicitly chosen
+        if (toDiscard.length < qty) {
+          toDiscard = [];
+          for (let i = hand.length - 1; i >= 0 && toDiscard.length < qty; i--) {
+            const id = hand[i];
+            const card = ctx.state.cards[id];
+            if (matchesCardGroup(card as any, group)) toDiscard.push(id);
+          }
+          if (toDiscard.length < qty) { continue; }
+        }
+        // Apply discard
+        for (const id of toDiscard) {
+          const idx = hand.lastIndexOf(id);
+          if (idx !== -1) hand.splice(idx, 1);
+          owner.discard.push(id);
+          // Mystic Rainbow Unicorn: перехват магии из сброса
+          maybeInterceptMagicToHand(ctx, owner, id);
+          moved++;
+        }
+        if (moved >= qty) break;
+      }
+      return moved >= qty;
+    }
+    case 'sacrifice': {
+      // Требуется явный выбор из своего стойла: ids берём из ctx.selectedTargets[currentSourceId]
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (sel as any)?.quantity?.value ?? 1;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      if (!chosen || chosen.length < qty) return false;
+      let moved = 0;
+      for (const id of chosen.slice(0, qty)) {
+        const sourceId3 = (ctx as any).currentSourceId as string | undefined;
+        const ignored = sourceId3 && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId3] && (ctx as any).ignoreTargets[sourceId3].includes(id);
+        if (ignored) continue;
+        // только из своего стойла
+        const idx = player.stable.indexOf(id);
+        if (idx === -1) continue;
+        const card = ctx.state.cards[id];
+        if (!matchesFilter(card, (sel as any)?.filters, (ctx as any).currentSourceId as string | undefined)) continue;
+        // Аура маски: маскированного единорога нельзя пожертвовать (даже себе, стоимостью)
+        if (!isTargetableFor('sacrifice', card as any, player.id, player.id, ctx.state)) continue;
+        player.stable.splice(idx, 1);
+        sendCardTo(ctx, player, id, player.discard);
+        // Mystic Rainbow Unicorn: перехват магии из сброса (если жертвовали магию — редкий случай, но поддержим обобщённо)
+        maybeInterceptMagicToHand(ctx, player, id);
+        moved++;
+      }
+      return moved >= qty;
+    }
+    case 'destroy': {
+      // Require explicit selection: consume IDs from ctx.selectedTargets[currentSourceId]
+      const sel = action.targets as unknown as TargetSelector;
+      const qty = (sel as any)?.quantity?.value ?? 1;
+      const group = (sel as any)?.filters?.card_group;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+      if (!chosen || chosen.length < qty) {
+        return false; // no random destruction; wait for selection via routes
+      }
+      let moved = 0;
+      // Validate and destroy chosen targets (must be in opponents' stables and match filters)
+      for (const id of chosen.slice(0, qty)) {
+        const sourceId4 = (ctx as any).currentSourceId as string | undefined;
+        const ignored = sourceId4 && (ctx as any).ignoreTargets && (ctx as any).ignoreTargets[sourceId4] && (ctx as any).ignoreTargets[sourceId4].includes(id);
+        if (ignored) continue;
+        // find owner among opponents
+        const owner = ctx.state.players.find(p => p.id !== player.id && p.stable.includes(id));
+        if (!owner) continue;
+        const card = ctx.state.cards[id];
+        if (!matchesCardGroup(card, group)) continue;
+        // уважать иммунитеты/таргетинг при явном выборе
+        if (!isTargetableFor('destroy', card as any, player.id, owner.id, ctx.state)) continue;
+        const idx = owner.stable.indexOf(id);
+        if (idx !== -1) {
+          owner.stable.splice(idx, 1);
+          sendCardTo(ctx, owner, id, owner.discard);
+          // Mystic Rainbow Unicorn: перехват магии из сброса
+          maybeInterceptMagicToHand(ctx, owner, id);
+          // Trigger when_destroyed effects for the previous owner
+          await triggerDestroyedEffectsFor(ctx, owner, id);
+          moved++;
+        }
+      }
+      return moved >= qty;
+    }
+    case 'search': {
+      // Full search implementation
+      const sel = (action as any).targets as TargetSelector;
+      const qty = (sel as any).quantity?.value ?? 1;
+      const filter = (sel as any)?.filters;
+      const place = (action as any)?.place as 'hand' | 'stable' | 'top_deck' | 'play_now' | undefined;
+      const reveal = !!(action as any)?.reveal;
+      const shuffleAfter = !!(action as any)?.shuffle_after;
+      const sourceId = (ctx as any).currentSourceId as string | undefined;
+      let moved = 0;
+      if (((sel as any).zone as any) === 'discard') {
+        // Require explicit selection from selectedTargets[source]
+        const chosen = (sourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[sourceId]) || [];
+        if (!Array.isArray(chosen) || chosen.length < qty) return false;
+        // Owner(s): by scope (default self); search through permitted owners' discards
+        const owners = getScopePlayers(ctx, player, sel);
+        for (const id of chosen.slice(0, qty)) {
+          let owner: PlayerState | undefined;
+          for (const o of owners) {
+            if (o.discard.includes(id)) { owner = o; break; }
+          }
+          if (!owner) continue;
+          const c = ctx.state.cards[id];
+          if (!matchesFilter(c, filter)) continue;
+          // remove from owner's discard
+          const idx = owner.discard.indexOf(id);
+          if (idx === -1) continue;
+          owner.discard.splice(idx, 1);
+          await placeFoundCard(ctx, player, id, place);
+          moved++;
+        }
+        return moved > 0;
+      }
+      // Default: deck search (shared or personal)
+      const deck = (ctx.state.deck ?? player.deck);
+      // iterate from top backwards and take first matching(s)
+      for (let i = deck.length - 1; i >= 0 && moved < qty; i--) {
+        const cardId = deck[i];
+        const card = ctx.state.cards[cardId];
+        if (!matchesFilter(card, filter)) continue;
+        // Малыш — только из Яслей: из колоды поиском не достаётся
+        if (!isCardAvailableFromZone(card, 'deck')) continue;
+        // remove from deck
+        deck.splice(i, 1);
+        // optional reveal event
+        if (reveal) {
+          try { (ctx.bus as any).emit({ type: 'reveal', cardId, to: player.id }); } catch {}
+        }
+        await placeFoundCard(ctx, player, cardId, place);
+        moved++;
+      }
+      if (shuffleAfter) {
+        // shuffle deck
+        for (let i = deck.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [deck[i], deck[j]] = [deck[j], deck[i]];
+        }
+      }
+      maybeEndOnDeckEmpty(ctx);
+      return moved > 0;
+    }
+    case 'shuffle_deck': {
+      // shuffle player's deck; choose owner as player for now
+      const deck = (ctx.state.deck ?? player.deck);
+      for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+      }
+      return true;
+    }
+    case 'extra_action': {
+      // Increase available action points for the current turn. Phase is informational in our engine; AP are consumed by routes.
+      const delta = (action as any).value ?? 1;
+      const add = Number(delta);
+      if (!Number.isFinite(add) || add <= 0) return false;
+      player.action_points = Math.max(0, (player.action_points || 0) + add);
+      return true;
+    }
+    case 'mega_shuffle': {
+      // md 70 «Единорог просто космос»: sources [all_hands, discard, deck] -> destination 'deck'.
+      // Всё перечисленное сгребается в одну колоду и перемешивается (Фишер–Йетс).
+      // Уважаем sources из данных: чего в списке нет — не трогаем.
+      const a = action as any;
+      const sources: string[] = Array.isArray(a.sources) ? a.sources : ['all_hands', 'discard', 'deck'];
+      const dest = String(a.destination || 'deck');
+      const destArr = getZoneArrayWithShared(ctx, player, dest);
+      if (!Array.isArray(destArr)) return false;
+      const gathered: string[] = [];
+      const take = (arr: string[] | undefined) => {
+        if (!Array.isArray(arr) || arr.length === 0) return;
+        for (const id of arr) gathered.push(id);
+        arr.length = 0;
+      };
+      // 'all_hands' — руки всех игроков, включая свои.
+      if (sources.includes('all_hands') || sources.includes('hands')) {
+        for (const p of ctx.state.players) take(p.hand);
+      }
+      // 'discard' — общий сброс и личные сбросы игроков (карты живут в обоих местах).
+      if (sources.includes('discard')) {
+        if (ctx.state.discard) take(ctx.state.discard);
+        for (const p of ctx.state.players) take(p.discard);
+      }
+      // 'deck' — колода (общая в state, иначе личная); берём без зачистки, чтобы не плодить ссылки.
+      if (sources.includes('deck')) {
+        for (const p of ctx.state.players) take(p.deck);
+      }
+      if (gathered.length === 0) return false;
+      for (const id of gathered) destArr.push(id);
+      // Фишер–Йетс по итоговой колоде
+      for (let i = destArr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [destArr[i], destArr[j]] = [destArr[j], destArr[i]];
+      }
+      maybeEndOnDeckEmpty(ctx);
+      return true;
+    }
+    case 'peek': {
+      // md 102 «Единорожий пророк»: посмотреть верх колоды, ничего не перемещая.
+      // Показ адресный — кладём id в ctx.peeked[playerId], клиент получает их оттуда.
+      const sel = (action as any)?.targets || (action as any)?.target;
+      const qtyRaw = Number((sel as any)?.quantity?.value ?? 1);
+      const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? Math.floor(qtyRaw) : 1;
+      const deckArr = getZoneArrayWithShared(ctx, player, 'deck');
+      if (!Array.isArray(deckArr) || deckArr.length === 0) return false;
+      // Верх колоды — конец массива; показываем qty верхних, не меняя порядок.
+      const top = deckArr.slice(Math.max(0, deckArr.length - qty)).reverse();
+      const c = ctx as any;
+      c.peeked = c.peeked || {};
+      c.peeked[player.id] = top;
+      return top.length > 0;
+    }
+    case 'mill_until': {
+      // md 118 «Поисковые работы»: с верха колоды в сброс, пока не найдётся карта по фильтру
+      // (card_group 'unicorn'); найденная уходит по destination (stable) и не считается сброшенной.
+      const sel = (action as any)?.targets || (action as any)?.target;
+      const filter = (sel as any)?.filters;
+      const destRaw = String((action as any)?.destination || 'stable');
+      const dest = destRaw === 'hand' || destRaw === 'stable' || destRaw === 'top_deck' ? destRaw : 'stable';
+      const deckArr = getZoneArrayWithShared(ctx, player, 'deck');
+      if (!Array.isArray(deckArr) || deckArr.length === 0) return false;
+      // Сброс: общий (state.discard), иначе личный. Тот же адрес, что у решафла в gameService.
+      const discardArr = ctx.state.discard ?? player.discard;
+      if (!Array.isArray(discardArr)) return false;
+      let milled = 0;
+      let found: string | undefined;
+      while (deckArr.length > 0) {
+        const cardId = deckArr.pop() as string;
+        const card = ctx.state.cards[cardId];
+        if (matchesFilter(card, filter)) { found = cardId; break; }
+        discardArr.push(cardId);
+        milled++;
+      }
+      if (found) await placeFoundCard(ctx, player, found, dest as any);
+      maybeEndOnDeckEmpty(ctx);
+      // Успех — если хоть что-то произошло: нашли карту или прокрутили колоду.
+      return !!found || milled > 0;
+    }
+    case 'draw_conditional': {
+      // md 119 «Радужный мост»: берём карту с верха колоды и смотрим, подходит ли она под условие.
+      // Условие из данных: condition.card_group (строка или массив групп).
+      // Подошла — on_success: добор ещё sub_quantity карт по destination (у md 119 в стойло);
+      // не подошла — on_fail: сама карта идёт в hand. Кладём через placeFoundCard, чтобы
+      // вход в стойло отработал как настоящий (triggerEnterEffectsFor), а не как голый push.
+      const dcA = action as any;
+      const dcQuantity = Number(dcA?.target?.quantity?.value ?? 1);
+      const dcQty = Number.isFinite(dcQuantity) && dcQuantity > 0 ? Math.floor(dcQuantity) : 1;
+      const dcGroup = dcA?.condition?.card_group;
+      const dcOnSuccess = dcA?.on_success || {};
+      const dcOnFail = dcA?.on_fail || {};
+      const dcSuccessDest = String(dcOnSuccess.destination || 'stable');
+      const dcFailDest = String(dcOnFail.destination || 'hand');
+      const dcSubRaw = Number(dcOnSuccess.sub_quantity?.value ?? dcOnSuccess.sub_quantity ?? 0);
+      const dcSubQty = Number.isFinite(dcSubRaw) && dcSubRaw > 0 ? Math.floor(dcSubRaw) : 0;
+      const dcDeck = getZoneArrayWithShared(ctx, player, 'deck');
+      if (!Array.isArray(dcDeck) || dcDeck.length === 0) return false;
+      let dcMoved = 0;
+      for (let i = 0; i < dcQty; i++) {
+        const cardId = dcDeck.pop();
+        if (!cardId) break;
+        const card = ctx.state.cards[cardId];
+        const ok = cardMatchesGroup(card, dcGroup);
+        if (ok) {
+          await placeFoundCard(ctx, player, cardId, dcSuccessDest as any);
+          // Добор по успеху берётся с верха уже после основной карты.
+          for (let k = 0; k < dcSubQty; k++) {
+            const extraId = dcDeck.pop();
+            if (!extraId) break;
+            // В6-3a/3-B: sub_action:'draw' (md 119) — вторая карта идёт В РУКУ, а не в destination.
+            // destination относится только к проверенной карте; без этого рука недобирала.
+            const subDest = String(dcOnSuccess.sub_action || '') === 'draw' ? 'hand' : dcSuccessDest;
+            await placeFoundCard(ctx, player, extraId, subDest as any);
+            dcMoved++;
+          }
+        } else {
+          await placeFoundCard(ctx, player, cardId, dcFailDest as any);
+        }
+        dcMoved++;
+      }
+      maybeEndOnDeckEmpty(ctx);
+      return dcMoved > 0;
+    }
+    case 'draw_until_limit': {
+      // md 127 «Единороготопия»: добор до лимита руки. Лимит — правило игры, а не число в коде:
+      // считает engine/handLimit.ts (база HAND_LIMIT_BASE=7 из game/config.ts + hand_limit_delta карт стойла).
+      // Раньше здесь читался player.hand_limit, но это поле не пишет никто во всём src/**.
+      const dulA = action as any;
+      const targetPlayer = String(dulA?.target_player || 'self');
+      // В6-3a/3-A: здесь стоял getScopePlayers({scope: targetPlayer}) — 'others'/'all' давали [],
+      // то есть md 127 не добирал никому, а тест «p1=7, p2=0» зеленел ложно.
+      const owners = drawRecipients(ctx, player, targetPlayer);
+      // В6-3a/3-C: единственный источник лимита руки — engine/handLimit.ts.
+      // player.hand_limit не пишет никто (на 329 картах каталога v2), читать его бессмысленно.
+      const limitOf = (p: PlayerState): number => handLimitFor(ctx.state, p);
+      let dulMoved = 0;
+      for (const owner of owners) {
+        const deckArr = getZoneArrayWithShared(ctx, owner, 'deck');
+        if (!Array.isArray(deckArr)) continue;
+        const limit = limitOf(owner);
+        while (owner.hand.length < limit && deckArr.length > 0) {
+          const cardId = deckArr.pop();
+          if (!cardId) break;
+          owner.hand.push(cardId);
+          dulMoved++;
+        }
+      }
+      maybeEndOnDeckEmpty(ctx);
+      return dulMoved > 0;
+    }
+    default:
+      // Неизвестный или ещё не реализованный вид действия: явный отказ, а не молчаливый успех.
+      // Остаются нереализованными: choice (нужен UI await_choice). counter не реализуется намеренно —
+      // механика Neigh/Super Neigh/Rewind/Objection живёт в окнах реакций gameService.ts.
+      console.warn('unhandled action kind: ' + String((action as any).kind));
+      return false;
+  }
+}

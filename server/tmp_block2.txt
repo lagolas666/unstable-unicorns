@@ -1,0 +1,35 @@
+916:   const targetPlayerId = req.body?.targetPlayerId ? String(req.body.targetPlayerId) : undefined;
+917:   const targets = Array.isArray(req.body?.targets) ? (req.body.targets as unknown[]).map((t) => String(t)) : undefined;
+918:   const result = await playCard(String(req.params.id), playerId, cardId, { chosenCostTargets, targetPlayerId, targets });
+919:   if (!result.ok) {
+920:     const payload: any = { message: result.message };
+921:     if (result.extra) Object.assign(payload, result.extra);
+922:     return res.status(result.http).json(payload);
+923:   }
+924:   const state = result.state;
+925:   try {
+926:     const io: any = (req.app as any).get('io');
+927:     if (result.pending) {
+928:       io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', result.pending);
+929:       io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+930:     } else {
+931:       io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+932:       io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+933:     }
+934:   } catch {}
+935:   if (result.pending) return res.json({ pending: result.pending, state });
+936:   res.json(state);
+937: });
+938: 
+939: // POST /api/game/:id/endTurn
+940: router.post('/:id/endTurn', async (req, res) => {
+941:   const result = await endTurn(String(req.params.id));
+942:   if (!result.ok) {
+943:     // D1: extra несёт признак оконченной партии ({ gameOver, winnerId })
+944:     const payload: any = { message: result.message };
+945:     if (result.extra) Object.assign(payload, result.extra);
+946:     return res.status(result.http).json(payload);
+947:   }
+948:   const state = result.state;
+949:   // BUG-01: окно самосброса по лимиту руки живёт в result.pending. Раньше роут отдавал
+950:   // только state, и игрок с рукой больше лимита не узнавал, что от него ждут выбора.

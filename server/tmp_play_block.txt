@@ -1,0 +1,15 @@
+921:     const payload: any = { message: result.message };
+922:     if (result.code) payload.code = result.code.toLowerCase();
+923:     if (result.extra) Object.assign(payload, result.extra);
+924:     return res.status(result.http).json(payload);
+925:       io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', result.pending);
+926:       io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+927:     } else {
+928:       io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+929:       io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));
+930:     }
+931:   } catch {}
+932:   if (result.pending) return res.json({ pending: result.pending, state });
+933:   res.json(state);
+934: });
+935: 

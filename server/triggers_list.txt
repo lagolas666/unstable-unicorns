@@ -1,0 +1,43 @@
+﻿case 'add': {
+case 'all':
+case 'all_players':
+case 'any':
+case 'any_player':
+case 'chosen': {
+case 'destroy': {
+case 'discard':
+case 'discard': {
+case 'draw_conditional':
+case 'draw_conditional': {
+case 'draw_until_limit':
+case 'draw_until_limit': {
+case 'extra_action': {
+case 'give':
+case 'goto_end_turn': {
+case 'grant_immunity': {
+case 'limit_actions': {
+case 'mega_shuffle': {
+case 'mill_until': {
+case 'modify_win_condition': {
+case 'move':
+case 'move': {
+case 'opponent': {
+case 'others':
+case 'peek': {
+case 'protect':
+case 'reorder_top': {
+case 'return':
+case 'return': {
+case 'reveal': {
+case 'sacrifice':
+case 'sacrifice': {
+case 'search':
+case 'search': {
+case 'self':
+case 'set_flag': {
+case 'shuffle_deck': {
+case 'skip_phase': {
+case 'steal':
+case 'steal': {
+case 'swap': {
+case 'transfer': {

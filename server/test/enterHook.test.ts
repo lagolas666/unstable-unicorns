@@ -1,10 +1,48 @@
-// Розыгрыш юнicорна из руки должен запускать хардкод-входы (triggerEnterEffectsFor) ровно один раз.
-// Задача Аналитика (вход из руки): Americorn, Zombie Knight, Puppetmaster, Frankencorn, Chronocorn.
-// Тесты через сервис playCard (тот же путь, что REST /play, тело запроса роут не меняет).
+// Вход в стойло: эффекты берутся из ДАННЫХ каталога v2 (card.effects, trigger: on_enter_stable),
+// а не из хардкод-блоков по английскому имени в triggerEnterEffectsFor.
+//
+// Задача Аналитика (шаг 2, п.21): перевести фикстуры на данные, чтобы 34 строки хардкода
+// в server/src/engine/executor.ts можно было снести без падения гейта.
+//
+// Три группы кейсов:
+//   1. DATA  — карта копируется из server/data/catalog.v2.json целиком (id/name/type/effects).
+//              Имя намеренно НЕ совпадает ни с одним хардкод-блоком (в каталоге оно русское),
+//              поэтому успех возможен только если эффект пришёл из данных.
+//   2. DOUBLE — страж двойного исполнения: карта с on_enter_stable в данных лежит в стойле
+//              незадолго до теста, имя совпадает с хардкод-блоком; эффект обязан сработать ровно
+//              ОДИН раз (hasDataEnter гасит хардкод, executor.ts L400-401). Два срабатывания
+//              краснят тест только после сноса хардкода — это и есть сигнал регрессии.
+//   3. БЕЗ АНГЛИЙСКОГО ИМЕНИ — карты, которых в каталоге v2 НЕТ (Zombie Knight, Puppetmaster,
+//              Sentinel, Portal Master, Ancestor, Chimeracorn, Epic Level Unicorn, Angry Dragoncorn,
+//              Alluring Narwhal, Academicorn, Elusive Oceloticorn). В каталоге у них нет ни id,
+//              ни effects, поэтому фикстуры задают effects.on_enter_stable вручную, а имена
+//              намеренно нейтральны («Некромант»/«Кукловод») — эффект обязан прийти из данных.
+//
+// Путь вызова — gameService.playCard (тот же, что REST /play и socket play_card): тело запроса
+// роут не меняет, поэтому фикстура проверяет ровно сервисный контракт.
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { games } from '../src/gameStore';
 import { playCard, resolvePendingNow } from '../src/gameService';
 import { EventBus } from '../src/engine/events';
+
+const CATALOG_PATH = path.join(__dirname, '..', 'data', 'catalog.v2.json');
+const rawCatalog = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
+const CATALOG: any[] = Array.isArray(rawCatalog) ? rawCatalog : rawCatalog.cards || rawCatalog.data || [];
+const CATALOG_BY_ID = new Map<string, any>(CATALOG.map((c) => [String(c.id), c]));
+
+/** Копия карты из каталога v2 — единственный источник id/name/type/effects в этом файле. */
+function fromCatalog(catalogId: string): any {
+  const src = CATALOG_BY_ID.get(catalogId);
+  if (!src) throw new Error('карты нет в catalog.v2.json: ' + catalogId);
+  return JSON.parse(JSON.stringify(src));
+}
+
+/** Фиктивная карта без эффектов (наполнитель руки/стойла). */
+function filler(id: string): any {
+  return { id, type: 'basic_unicorn', name: id, effects: [] };
+}
 
 function mkState(over: any = {}) {
   const mkPlayer = (id: string, extra: any = {}) => ({
@@ -21,7 +59,7 @@ function mkState(over: any = {}) {
   return {
     players: [mkPlayer('p1'), mkPlayer('p2')],
     cards: {} as Record<string, any>,
-    // D1b: непустая колода — иначе фоллбек «колода И сброс пусты» сразу объявляет партию оконченной
+    // Непустая колода: иначе фоллбек «колода И сброс пусты» сразу объявляет партию оконченной (D1b)
     deck: ['z1', 'z2'] as string[],
     discard: [] as string[],
     turn: { currentPlayerId: 'p1', phase: 'action', has_drawn: false },
@@ -35,61 +73,264 @@ function entryOf(state: any) {
   return id;
 }
 
+/** Снять таймер окна, иначе jest не завершится. */
+function disposeEntry(id: string) {
+  const ent: any = games.get(id);
+  if (ent && ent.pendingTimeout) {
+    clearTimeout(ent.pendingTimeout);
+    ent.pendingTimeout = null;
+  }
+}
+
 afterEach(() => {
   jest.useRealTimers();
 });
 
-function unicorn(id: string, name: string, effects: any[]) {
-  return { id, type: 'basic_unicorn', name, effects };
-}
-
-describe('Вход в стойло из руки: playCard запускает хардкод-входы ровно один раз', () => {
-  it('Americorn: p1 рука 1 (после розыгрыша +1 pull), p2 рука 2 -> 1', async () => {
+describe('Вход в стойло из данных каталога v2 (effects.on_enter_stable)', () => {
+  it('D1 Chronocorn: discard 1 из данных, имя русское — хардкод-блок по "chronocorn" не при чём', async () => {
     const state = mkState();
-    state.cards.am = unicorn('am', 'Americorn', [
-      { trigger: 'on_enter_stable', actions: [{ kind: 'pull', targets: { scope: 'other', zone: 'hand', quantity: { value: 1 } } }] },
-    ]);
-    state.cards.o1 = { id: 'o1', type: 'basic_unicorn', name: 'X', effects: [] };
-    state.cards.o2 = { id: 'o2', type: 'basic_unicorn', name: 'Y', effects: [] };
-    state.players[0].hand = ['am'];
-    state.players[1].hand = ['o1', 'o2'];
+    const card = fromCatalog('chronocorn_ultimate');
+    // Страховка от регрессии фикстуры: имя не должно содержать английского токена хардкода
+    expect(String(card.name).toLowerCase()).not.toContain('chronocorn');
+    state.cards[card.id] = card;
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = [card.id, 'a', 'b'];
     const id = entryOf(state);
 
-    const res = await playCard(id, 'p1', 'am');
+    const res = await playCard(id, 'p1', card.id);
     expect(res.ok).toBe(true);
     const s = games.get(id)!.state;
-    // Ожидание: p1 рука 1 (pull ровно одной карты), p2 рука 1. Баг сейчас: p1 рука 0 (хука нет).
+    // Данные: discard 1 свою карту. После розыгрыша рука [a, b] -> на руке 1, в сбросе 1.
+    // Невакуумность: без исполнения из данных на руке осталось бы 2 и сброс был бы пуст.
     expect(s.players[0].hand).toHaveLength(1);
-    expect(s.players[1].hand).toHaveLength(1);
+    expect(s.players[0].discard).toHaveLength(1);
+    expect(s.players[0].stable).toContain(card.id);
+    disposeEntry(id);
   });
 
-  it('Zombie Knight: discard 4 ровно один раз (рука 5 -> 1)', async () => {
+  it('D2 Frankenunicorn: discard 1 из данных (в v2 нет "Frankencorn", хардкод-токен другой)', async () => {
     const state = mkState();
-    state.cards.zk = unicorn('zk', 'Zombie Knight Unicorn', []);
+    const card = fromCatalog('frankenunicorn_ultimate');
+    expect(String(card.name).toLowerCase()).not.toContain('frankencorn');
+    state.cards[card.id] = card;
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = [card.id, 'a', 'b'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', card.id);
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    expect(s.players[0].hand).toHaveLength(1);
+    expect(s.players[0].discard).toHaveLength(1);
+    disposeEntry(id);
+  });
+
+  it('D3 Puppeteer: discard 1 СЕБЕ из данных (не force_discard защитника, как в хардкоде Puppetmaster)', async () => {
+    const state = mkState();
+    const card = fromCatalog('puppeteer_unicorn_ultimate');
+    state.cards[card.id] = card;
+    for (const k of ['a', 'x', 'y']) state.cards[k] = filler(k);
+    state.players[0].hand = [card.id, 'a'];
+    state.players[1].hand = ['x', 'y'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', card.id);
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    // Данные Puppeteer: discard 1 у себя. Окна выбора защитника быть не должно.
+    expect(games.get(id)!.pending).toBeNull();
+    expect(s.players[0].hand).toHaveLength(0);
+    expect(s.players[0].discard).toHaveLength(1);
+    expect(s.players[1].hand).toHaveLength(2); // защитника не тронули
+    disposeEntry(id);
+  });
+
+  it('D4 Nightmare Unicorn: карта доходит до стойла и не жертвует саму себя (exclude_self)', async () => {
+    // BUG-NM-EXSELF исправлен: filters.exclude_self реализован в engine/executor.ts, поэтому
+    // sacrifice 3 при входе в стойло не может взять целью саму карту-источник. Кейс — страж
+    // от регрессии: если exclude_self снова перестанет применяться, карта уйдёт в сброс и
+    // ожидания ниже покраснеют.
+    const state = mkState();
+    const card = fromCatalog('nightmare_unicorn_ultimate');
+    state.cards[card.id] = card;
+    state.players[0].hand = [card.id];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', card.id);
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    expect(s.players[0].hand).toHaveLength(0); // карта из руки ушла
+    expect(s.players[0].stable).toContain(card.id); // карта в стойле — само-жертвы нет
+    expect(s.players[0].discard).not.toContain(card.id);
+    disposeEntry(id);
+  });
+
+  it('D4b exclude_self у Nightmare Unicorn есть в данных каталога (инвариант фикстуры)', () => {
+    const card = fromCatalog('nightmare_unicorn_ultimate');
+    const enter = (card.effects || []).find((e: any) => e && e.trigger === 'on_enter_stable');
+    expect(enter).toBeTruthy();
+    const sac = (enter.actions || []).find((a: any) => a && a.kind === 'sacrifice');
+    expect(sac).toBeTruthy();
+    expect(sac.target.filters.exclude_self).toBe(true);
+  });
+
+  it('D5 живая проверка каталога: у карт группы D в данных есть on_enter_stable', () => {
+    for (const catalogId of ['chronocorn_ultimate', 'frankenunicorn_ultimate', 'puppeteer_unicorn_ultimate', 'nightmare_unicorn_ultimate']) {
+      const card = fromCatalog(catalogId);
+      const enters = (card.effects || []).filter((e: any) => e && e.trigger === 'on_enter_stable');
+      expect(enters.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('D6 optional: on_enter_stable с optional:true не исполняется автоматически (executor.ts L594)', async () => {
+    // Покрытия не было: мутация «инвертировать фильтр optional» не краснила ни один тест.
+    const state = mkState();
+    state.cards.op = {
+      id: 'op',
+      type: 'basic_unicorn',
+      name: 'Доброволец',
+      effects: [
+        {
+          trigger: 'on_enter_stable',
+          optional: true,
+          actions: [
+            { kind: 'discard', target: { scope: 'self', zone: 'hand', quantity: { value: 1 } } },
+          ],
+        },
+      ],
+    };
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = ['op', 'a', 'b'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', 'op');
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    // optional:true ждёт согласия игрока — автоматического сброса быть не должно.
+    expect(s.players[0].hand).toEqual(['a', 'b']);
+    expect(s.players[0].discard).toHaveLength(0);
+    disposeEntry(id);
+  });
+});
+
+describe('Страж двойного исполнения: данные гасят хардкод (hasDataEnter)', () => {
+  // Карта-двойник: id и effects — из каталога, но name выставлен английским так, чтобы
+  // совпасть с хардкод-блоком. Без гашения эффект сработал бы ДВАЖДЫ (данные + хардкод).
+  it('G1 Chronocorn с английским именем: discard 1 ровно один раз (рука 3 -> 2, не 1)', async () => {
+    const state = mkState();
+    const card = fromCatalog('chronocorn_ultimate');
+    card.name = 'Chronocorn'; // намеренно попадает в nameLower.includes('chronocorn')
+    state.cards[card.id] = card;
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = [card.id, 'a', 'b'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', card.id);
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    // Один сброс (данные) = на руке 1, в сбросе 1.
+    // Два сброса (данные + хардкод) дали бы руку 0 и сброс 2 — именно это ловит страж.
+    expect(s.players[0].discard).toHaveLength(1);
+    expect(s.players[0].hand).toHaveLength(1);
+    disposeEntry(id);
+  });
+
+  it('G2 Frankenunicorn с именем "Frankencorn": discard 1 ровно один раз', async () => {
+    const state = mkState();
+    const card = fromCatalog('frankenunicorn_ultimate');
+    card.name = 'Frankencorn';
+    state.cards[card.id] = card;
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = [card.id, 'a', 'b'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', card.id);
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    expect(s.players[0].discard).toHaveLength(1);
+    expect(s.players[0].hand).toHaveLength(1);
+    disposeEntry(id);
+  });
+
+  it('G3 карта БЕЗ данных и БЕЗ имени: эффекта входа нет вообще (контроль, 0 сбросов)', async () => {
+    const state = mkState();
+    state.cards.nu = { id: 'nu', type: 'basic_unicorn', name: 'Neutral Card', effects: [] };
+    for (const k of ['a', 'b']) state.cards[k] = filler(k);
+    state.players[0].hand = ['nu', 'a', 'b'];
+    const id = entryOf(state);
+
+    const res = await playCard(id, 'p1', 'nu');
+    expect(res.ok).toBe(true);
+    const s = games.get(id)!.state;
+    expect(s.players[0].discard).toHaveLength(0);
+    expect(s.players[0].hand).toHaveLength(2);
+    disposeEntry(id);
+  });
+});
+
+describe('Карты без английского имени в каталоге v2: эффект из данных (бывшая HARDCODE-ONLY группа)', () => {
+  // Эти карты в catalog.v2.json НЕ существуют (проверено инвариантом H0 ниже), поэтому в каталоге
+  // у них нет ни id, ни effects: фикстуры задают effects.on_enter_stable вручную, а имена
+  // «Некромант»/«Кукловод» намеренно нейтральны — успех возможен только если эффект пришёл из данных.
+  it('H1 карта с discard 4 в данных: рука 5 -> 1 (эффект из effects.on_enter_stable)', async () => {
+    const state = mkState();
+    // Эффект приходит из ДАННЫХ карты, а не из хардкод-блока по английскому имени.
+    state.cards.zk = {
+      id: 'zk',
+      type: 'basic_unicorn',
+      name: 'Некромант',
+      effects: [
+        {
+          trigger: 'on_enter_stable',
+          actions: [
+            { kind: 'discard', target: { scope: 'self', zone: 'hand', quantity: { value: 4 } } },
+          ],
+        },
+      ],
+    };
     state.players[0].hand = ['zk', 'a', 'b', 'c', 'd', 'e'];
-    for (const k of ['a', 'b', 'c', 'd', 'e']) state.cards[k] = { id: k, type: 'basic_unicorn', name: k, effects: [] };
+    for (const k of ['a', 'b', 'c', 'd', 'e']) state.cards[k] = filler(k);
     const id = entryOf(state);
 
     const res = await playCard(id, 'p1', 'zk');
     expect(res.ok).toBe(true);
     const s = games.get(id)!.state;
-    // Ожидание: на руке 5 -> discard 4 -> 1. Двойной вызов дал бы 0.
+    // Ожидание: 5 -> discard 4 -> 1. Двойной вызов дал бы 0.
     expect(s.players[0].hand).toHaveLength(1);
+    disposeEntry(id);
   });
 
-  it('Puppetmaster: force_discard открывает окно выбора защитника (p2: 3 -> 2 после ответа)', async () => {
+  it('H2 карта с requires_success_of_previous: force_discard открывает окно выбора (данные)', async () => {
     const state = mkState();
-    state.cards.pm = unicorn('pm', 'Puppetmaster Unicorn', []);
+    // Две ступени из данных: discard 1 себе, и только при успехе — force_discard 2 соперникам.
+    state.cards.pm = {
+      id: 'pm',
+      type: 'basic_unicorn',
+      name: 'Кукловод',
+      effects: [
+        {
+          trigger: 'on_enter_stable',
+          actions: [
+            { kind: 'discard', target: { scope: 'self', zone: 'hand', quantity: { value: 1 } } },
+            {
+              kind: 'force_discard',
+              requires_success_of_previous: true,
+              target: { scope: 'other', zone: 'hand', quantity: { value: 2 } },
+            },
+          ],
+        },
+      ],
+    };
     state.players[0].hand = ['pm', 'a'];
     state.players[1].hand = ['x', 'y', 'z'];
-    for (const k of ['a', 'x', 'y', 'z']) state.cards[k] = { id: k, type: 'basic_unicorn', name: k, effects: [] };
+    for (const k of ['a', 'x', 'y', 'z']) state.cards[k] = filler(k);
     const id = entryOf(state);
 
     const res = await playCard(id, 'p1', 'pm');
     expect(res.ok).toBe(true);
 
-    // 1. Эффект остановлен: открыто окно выбора, рука защитника не тронута.
-    //    Случайный сброс (chosenByPlayer=NO) — дефект TC-025, а не норма.
+    // Эффект остановлен: открыто окно выбора, рука защитника не тронута.
+    // Случайный сброс (chosenByPlayer=NO) — дефект TC-025, а не норма.
     const pend: any = games.get(id)!.pending;
     expect(pend).toBeTruthy();
     expect(pend.kind).toBe('await_choice');
@@ -101,7 +342,7 @@ describe('Вход в стойло из руки: playCard запускает х
     expect(before.players[1].hand).toHaveLength(3);
     expect(before.players[1].discard).toHaveLength(0);
 
-    // 2. Защитник отвечает: выбранная карта в сбросе, эффект не повторяется.
+    // Защитник отвечает: выбранная карта в сбросе, эффект не повторяется.
     const r2 = await resolvePendingNow(id, { byPlayerId: 'p2', cardId: 'y' }, undefined as any);
     expect(r2.ok).toBe(true);
 
@@ -115,58 +356,42 @@ describe('Вход в стойло из руки: playCard запускает х
     const logged = games.get(id)!.logs.some((l: any) => l?.details?.chosenByPlayer === true);
     expect(logged).toBe(true);
 
-    // Окно с таймером не должно держать jest открытым.
-    const ent: any = games.get(id)!;
-    if (ent.pendingTimeout) {
-      clearTimeout(ent.pendingTimeout);
-      ent.pendingTimeout = null;
+    disposeEntry(id);
+  });
+
+  it('H0 инвариант: карт HARDCODE-ONLY действительно нет в каталоге v2', () => {
+    const names = CATALOG.map((c) => String(c.name_en || c.name || '').toLowerCase());
+    for (const probe of ['zombie knight', 'puppetmaster', 'frankencorn', 'sentinel', 'portal master', 'ancestor', 'chimeracorn', 'epic level unicorn']) {
+      const hit = names.filter((n) => n.includes(probe));
+      expect(hit).toHaveLength(0);
     }
-  });
-
-  it('Frankencorn: discard 1 ровно один раз (рука 2 -> 1)', async () => {
-    const state = mkState();
-    state.cards.fk = unicorn('fk', 'Frankencorn', []);
-    state.cards.a = { id: 'a', type: 'basic_unicorn', name: 'a', effects: [] };
-    state.cards.b = { id: 'b', type: 'basic_unicorn', name: 'b', effects: [] };
-    state.players[0].hand = ['fk', 'a', 'b'];
-    const id = entryOf(state);
-
-    const res = await playCard(id, 'p1', 'fk');
-    expect(res.ok).toBe(true);
-    const s = games.get(id)!.state;
-    expect(s.players[0].hand).toHaveLength(1);
-  });
-
-  it('Chronocorn: discard 1 ровно один раз (рука 2 -> 1)', async () => {
-    const state = mkState();
-    state.cards.cc = unicorn('cc', 'Chronocorn', []);
-    state.cards.a = { id: 'a', type: 'basic_unicorn', name: 'a', effects: [] };
-    state.cards.b = { id: 'b', type: 'basic_unicorn', name: 'b', effects: [] };
-    state.players[0].hand = ['cc', 'a', 'b'];
-    const id = entryOf(state);
-
-    const res = await playCard(id, 'p1', 'cc');
-    expect(res.ok).toBe(true);
-    const s = games.get(id)!.state;
-    expect(s.players[0].hand).toHaveLength(1);
+    // Ameri'corn есть, но с апострофом — хардкод-токен 'americorn' его не ловит
+    expect(names.some((n) => n.includes("ameri'corn"))).toBe(true);
   });
 });
 
 describe('Путь через окно реакций (performPlayNow / resolvePendingNow)', () => {
-  it('Americorn: хардкод-вход срабатывает и после resolvePendingNow', async () => {
+  it('R1 card с on_enter_stable из данных: эффект входа работает и при skipGenericLoop (добор ровно 1)', async () => {
     const state = mkState();
-    // Юникорн с on_play в данных -> playCard открывает окно реакций вместо немедленного розыгрыша
-    state.cards.am = unicorn('am', 'Americorn', [
-      { trigger: 'on_play', actions: [{ kind: 'discard', targets: { scope: 'self', zone: 'hand', quantity: { value: 1 } } }] },
-    ]);
-    state.cards.a = { id: 'a', type: 'basic_unicorn', name: 'a', effects: [] };
-    state.cards.x = { id: 'x', type: 'basic_unicorn', name: 'x', effects: [] };
-    state.cards.y = { id: 'y', type: 'basic_unicorn', name: 'y', effects: [] };
-    state.players[0].hand = ['am', 'a'];
-    state.players[1].hand = ['x', 'y'];
+    // on_play в данных открывает окно реакций; on_enter_stable обязан отработать после resolvePendingNow
+    state.cards.ch = {
+      id: 'ch',
+      type: 'basic_unicorn',
+      name: 'Нейтральная карта',
+      effects: [
+        { trigger: 'on_play', actions: [{ kind: 'draw', targets: { quantity: { value: 1 } } }] },
+        { trigger: 'on_enter_stable', actions: [{ kind: 'discard', targets: { scope: 'self', zone: 'hand', quantity: { value: 1 } } }] },
+      ],
+    };
+    state.cards.a = filler('a');
+    state.cards.b = filler('b');
+    state.cards.d1 = filler('d1');
+    state.cards.d2 = filler('d2');
+    state.players[0].hand = ['ch', 'a', 'b'];
+    (state as any).deck = ['d1', 'd2'];
     const id = entryOf(state);
 
-    const res = await playCard(id, 'p1', 'am');
+    const res = await playCard(id, 'p1', 'ch');
     expect(res.ok).toBe(true);
     expect((res as any).openedWindow).toBe(true);
     expect(games.get(id)!.pending).toBeTruthy();
@@ -174,20 +399,22 @@ describe('Путь через окно реакций (performPlayNow / resolveP
     const r2 = await resolvePendingNow(id, {}, undefined as any);
     expect(r2.ok).toBe(true);
     const s = games.get(id)!.state;
-    // on_play сбросил 1 карту (a), хардкод-вход забрал 1 карту у p2
-    expect(s.players[0].hand).toHaveLength(1);
-    expect(s.players[1].hand).toHaveLength(1);
+    // on_play дал +1 (3 -> 4 карты в руке вместе с разыгранной), вход сбросил 1 -> на руке 2
+    expect(s.players[0].hand).toHaveLength(2);
+    disposeEntry(id);
   });
 
-  it('двойной on_play: юникорн с on_play в данных добирает ровно 1 карту (generic-цикл пропущен)', async () => {
+  it('R2 двойной on_play: юникорн с on_play в данных добирает ровно 1 карту (generic-цикл не дублирует)', async () => {
     const state = mkState();
-    state.cards.td = unicorn('td', 'Testdoublecorn', [
-      { trigger: 'on_play', actions: [{ kind: 'draw', targets: { quantity: { value: 1 } } }] },
-    ]);
-    state.cards.d1 = { id: 'd1', type: 'basic_unicorn', name: 'd1', effects: [] };
-    state.cards.d2 = { id: 'd2', type: 'basic_unicorn', name: 'd2', effects: [] };
+    state.cards.td = {
+      id: 'td',
+      type: 'basic_unicorn',
+      name: 'Testdoublecorn',
+      effects: [{ trigger: 'on_play', actions: [{ kind: 'draw', targets: { quantity: { value: 1 } } }] }],
+    };
+    state.cards.d1 = filler('d1');
+    state.cards.d2 = filler('d2');
     state.players[0].hand = ['td'];
-    // Колода общая: executor читает ctx.state.deck (getZoneArrayWithShared), не player.deck
     (state as any).deck = ['d1', 'd2'];
     const id = entryOf(state);
 
@@ -198,5 +425,6 @@ describe('Путь через окно реакций (performPlayNow / resolveP
     const s = games.get(id)!.state;
     // Ровно один добор: без skipGenericLoop было бы 2
     expect(s.players[0].hand).toHaveLength(1);
+    disposeEntry(id);
   });
 });

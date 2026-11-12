@@ -475,7 +475,7 @@ describe('Socket contract: реакции (6b-3c-2)', () => {
     expect(ack.code).toBe('GAME_NOT_FOUND');
   });
 
-  it('S19 resolve_pending без открытого окна → BAD_REQUEST, без исключения наружу, состояние цело', async () => {
+  it('S19 resolve_pending без открытого окна → nothing_pending (D-2), без исключения наружу, состояние цело', async () => {
     registerSocketHandlers(io as any);
     const gameId = await seedGame();
     const socket = makeSocket();
@@ -483,13 +483,14 @@ describe('Socket contract: реакции (6b-3c-2)', () => {
     const ack = await socket.trigger('resolve_pending', { gameId, playerId: 'p1' });
 
     expect(ack.ok).toBe(false);
-    expect(ack.code).toBe('BAD_REQUEST');
+    // D-2 (решение Аналитика): resolvePending без окна отдаёт code 'nothing_pending'
+    expect(ack.code).toBe('nothing_pending');
     expect(ack.message).toBe('Nothing pending');
     expect(games.get(gameId)!.state.players[0].hand).toEqual(['c_basic_1']);
     expect(games.get(gameId)!.state.players[0].stable).toEqual([]);
   });
 
-  it('S20 resolve_pending после neigh закрывает окно; сыгранная карта остаётся в руке актёра', async () => {
+  it('S20 resolve_pending после neigh закрывает окно; отменённая карта уходит в сброс (BUG-02)', async () => {
     registerSocketHandlers(io as any);
     const gameId = await seedNeighWindow();
     const socket = makeSocket();
@@ -501,7 +502,9 @@ describe('Socket contract: реакции (6b-3c-2)', () => {
     expect(ack.pending).toBeNull();
     expect(pendingOf(gameId)).toBeNull();
     const p1 = games.get(gameId)!.state.players[0];
-    expect(p1.hand).toContain('c_basic_1');
+    // Рулинг BUG-02: «send it to the discard pile» — карта не возвращается в руку.
+    expect(p1.hand).not.toContain('c_basic_1');
+    expect(p1.discard).toContain('c_basic_1');
     expect(p1.stable).not.toContain('c_basic_1');
   });
 

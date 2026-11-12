@@ -264,20 +264,29 @@ describe('Service contract: endTurn', () => {
     expect(entry.logs[0].playerId).toBe('p1');
   });
 
-  it('E3: рука сверх лимита (8/7) -> 400 с прежним текстом, ход не передан', async () => {
+  it('E3: рука сверх лимита (8/7) -> окно выбора hand_limit, ход не передан (BUG-01)', async () => {
     const state = mkState();
     state.players[0].hand = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
     const id = entryOf(state);
     const entry = games.get(id)!;
 
     const res = await endTurn(id);
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error('ожидался отказ');
-    expect(res.code).toBe('BAD_REQUEST');
-    expect(res.http).toBe(400);
-    expect(res.message).toBe('Hand limit exceeded: 8/7');
+    // Рулинг BUG-01: отказа «Hand limit exceeded» больше нет — открывается окно выбора.
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(JSON.stringify(res));
+    const pending = res.pending as any;
+    expect(pending).toBeTruthy();
+    expect(pending.kind).toBe('await_choice');
+    expect(pending.purpose).toBe('hand_limit');
+    expect(pending.chooserId).toBe('p1');
+    expect(pending.remaining).toBe(1);
+    const stored: any = entry.pending;
+    expect(stored).toBeTruthy();
+    expect(stored.purpose).toBe('hand_limit');
+    // До выбора ход остаётся у актора, рука не тронута, сброс пуст.
     expect(entry.state.turn.currentPlayerId).toBe('p1');
-    expect(entry.logs).toHaveLength(0);
+    expect(entry.state.players[0].hand).toHaveLength(8);
+    expect(entry.state.players[0].discard).toHaveLength(0);
   });
 
   it('E4: ровно 7 карт в руке — ход завершается (граница лимита)', async () => {

@@ -1,0 +1,107 @@
+// BUG-NM-EXSELF: filters.exclude_self не реализован (0 вхождений в server/src/**).
+// Тест идёт через публичный resolveActions и EventBus, как nurseryDestination.test.ts.
+// Фикстуры — только данные (card.effects / target), никаких сравнений по имени карты.
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { resolveActions, ResolveContext } from '../src/engine/executor';
+import { EventBus } from '../src/engine/events';
+import { Action } from '../../shared/src/types';
+
+function unicorn(id: string) {
+  return { id, name: id, type: 'basic_unicorn', effects: [] } as any;
+}
+
+function makeState(opts: {
+  p1Stable: string[];
+  p2Stable: string[];
+  cards: Record<string, any>;
+}) {
+  const mkPlayer = (id: string, stable: string[]) =>
+    ({ id, deck: [], hand: [], discard: [], stable: [...stable], nursery: [], field: [], action_points: 1 }) as any;
+  return {
+    players: [mkPlayer('p1', opts.p1Stable), mkPlayer('p2', opts.p2Stable)],
+    cards: opts.cards,
+    turn: { currentPlayerId: 'p1', phase: 'action', has_drawn: false },
+    deck: ['d1'],
+    discard: [],
+    nursery: [],
+  } as any;
+}
+
+function makeCtx(state: any, selected: Record<string, string[]>): ResolveContext {
+  return { state, bus: new EventBus(), selectedTargets: selected, currentSourceId: 'src' } as any;
+}
+
+// sacrifice 3 из своего стойла, актор (источник эффекта) исключён по данным.
+const sacrificeThreeExcludeSelf = [
+  { kind: 'sacrifice', target: { scope: 'self', zone: 'stable', quantity: { value: 3 }, filters: { card_group: 'any', exclude_self: true } } },
+] as unknown as Action[];
+
+// sacrifice 1 из своего стойла без exclude_self (контроль базового поведения).
+const sacrificeOneSelf = [
+  { kind: 'sacrifice', target: { scope: 'self', zone: 'stable', quantity: { value: 1 }, filters: { card_group: 'any' } } },
+] as unknown as Action[];
+
+// destroy у соперника с exclude_self — актор не в списке целей, соперник — цель.
+const destroyOpponentExcludeSelf = [
+  { kind: 'destroy', target: { scope: 'opponent', zone: 'stable', quantity: { value: 1 }, filters: { card_group: 'any', exclude_self: true } } },
+] as unknown as Action[];
+
+describe('BUG-NM-EXSELF: filters.exclude_self', () => {
+  it('E1. sacrifice 3 с exclude_self: выбранный актор НЕ жертвуется и остаётся в стойле; обычные единороги уходят', async () => {
+    // nm — актор (источник эффекта). Игрок выбирает nm и двух обычных единорогов.
+    const state = makeState({
+      p1Stable: ['nm', 'u1', 'u2', 'u3'],
+      p2Stable: [],
+      cards: { nm: unicorn('nm'), u1: unicorn('u1'), u2: unicorn('u2'), u3: unicorn('u3') },
+    });
+    const ctx = makeCtx(state, { src: ['nm', 'u1', 'u2'] });
+    await resolveActions(ctx, state.players[0], sacrificeThreeExcludeSelf);
+    expect(state.players[0].stable).toContain('nm');
+    expect(state.players[0].discard).not.toContain('nm');
+    expect(state.players[0].discard).toEqual(expect.arrayContaining(['u1', 'u2']));
+  });
+
+  it('E2. контроль: sacrifice 1 без exclude_self — актор может быть целью, поведение прежнее', async () => {
+    const state = makeState({
+      p1Stable: ['nm', 'u1'],
+      p2Stable: [],
+      cards: { nm: unicorn('nm'), u1: unicorn('u1') },
+    });
+    const ctx = makeCtx(state, { src: ['nm'] });
+    const ok = await resolveActions(ctx, state.players[0], sacrificeOneSelf);
+    expect(ok).toBe(true);
+    expect(state.players[0].discard).toEqual(['nm']);
+    expect(state.players[0].stable).toEqual(['u1']);
+  });
+
+  it('E3. destroy у соперника с exclude_self: актор не в целях, соперник уничтожается, резолв проходит', async () => {
+    const state = makeState({
+      p1Stable: ['nm'],
+      p2Stable: ['x1'],
+      cards: { nm: unicorn('nm'), x1: unicorn('x1') },
+    });
+    const ctx = makeCtx(state, { src: ['x1'] });
+    const ok = await resolveActions(ctx, state.players[0], destroyOpponentExcludeSelf);
+    expect(ok).toBe(true);
+    expect(state.players[1].discard).toEqual(['x1']);
+    expect(state.players[0].stable).toEqual(['nm']);
+  });
+
+  it('E4. данные: в catalog.v2.json ровно 13 карт с filters.exclude_self, среди них nightmare_unicorn_ultimate', () => {
+    const catPath = path.join(__dirname, '..', 'data', 'catalog.v2.json');
+    const cat = JSON.parse(fs.readFileSync(catPath, 'utf8'));
+    const cards: any[] = Array.isArray(cat) ? cat : (cat.cards || Object.values(cat));
+    const ids = new Set<string>();
+    const walk = (node: any, cid: string) => {
+      if (!node || typeof node !== 'object') return;
+      if (Array.isArray(node)) { node.forEach(n => walk(n, cid)); return; }
+      if (node.exclude_self === true) ids.add(cid);
+      for (const k of Object.keys(node)) walk(node[k], cid);
+    };
+    for (const c of cards) walk(c, c.id || c.card_id);
+    expect(ids.size).toBe(13);
+    expect(ids.has('nightmare_unicorn_ultimate')).toBe(true);
+  });
+});

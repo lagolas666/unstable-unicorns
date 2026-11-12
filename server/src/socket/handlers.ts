@@ -11,6 +11,7 @@ import {
   endTurn,
   drawCard,
   RouteOutcome,
+  ServiceErrorCode,
   reactNeigh,
   reactSuperNeigh,
   reactRedirect,
@@ -29,14 +30,8 @@ import {
 } from '../gameService';
 
 // Коды ошибок заморожены под docs/socket-contract.md
-export type SocketErrorCode =
-  | 'GAME_NOT_FOUND'
-  | 'BAD_REQUEST'
-  | 'NOT_YOUR_TURN'
-  | 'CARD_NOT_IN_HAND'
-  | 'NO_ACTION_POINTS'
-  | 'WRONG_PHASE'
-  | 'PENDING_ACTION';
+// SocketErrorCode = ServiceErrorCode (импортирован) + специфичные socket-коды
+export type SocketErrorCode = ServiceErrorCode | 'nothing_pending';
 
 export type SocketAck =
   | { ok: true; state?: GameState; pending?: any; logs?: LogEntry[] }
@@ -239,7 +234,9 @@ export function registerSocketHandlers(io: SocketIOServer): void {
         if (!result.ok) return reply(ack, fail(result.code, result.message, result.extra));
 
         broadcastState(io, gameId, result.state, result.logs);
-        reply(ack, { ok: true, state: result.state, logs: result.logs.slice(-100) });
+        // BUG-01: окно самосброса (hand_limit) живёт в entry.pending — отдаём клиенту вместе с state
+        const pend = (result as any).pending ?? (getGame(gameId) as any)?.pending ?? null;
+        reply(ack, { ok: true, state: result.state, logs: result.logs.slice(-100), pending: pend } as any);
       } catch (err: any) {
         reply(ack, fail('BAD_REQUEST', String(err?.message || err)));
       }

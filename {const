@@ -1,0 +1,1 @@
+const c=require('./server/data/catalog.v2.json');const r={};c.forEach(x= k=x.rarity;r[k]=(r[k]

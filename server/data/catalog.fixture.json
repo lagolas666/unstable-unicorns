@@ -1870,6 +1870,7 @@
   "name": "Epic Level Unicorn",
   "type": "ultimate_unicorn",
   "description": "Когда эта карта входит в твоё стойло, ПОЖЕРТВУЙ 2 карты Единорога. Каждый раз, когда ты УНИЧТОЖАЕШЬ карту, ты можешь УНИЧТОЖИТЬ 2 карты вместо одной.",
+  "double_destroy": true,
   "image": "/uploads/wiki/78fb1a76c8fa5b4cd04e1cc90cfa4685.png",
   "active": true,
   "deck_count": 1,
@@ -3248,6 +3249,7 @@
   "description": "Secнаd Editiна: When this crd enters тыr Stble, DISCARD тыr hи. Ech time nor plyer переместиs Mgic crd в сбрось pile fter plyвg it, ты можешь добавь thв crd в тыr hи.",
   "image": "/uploads/wiki/af2f44fe95784706f2b6581d20c21e04.png",
   "active": true,
+  "intercept_magic": true,
   "deck_count": 1,
   "effects": []
  },

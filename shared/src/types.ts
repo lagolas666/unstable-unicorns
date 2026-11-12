@@ -16,27 +16,51 @@ export type Phase = 'draw' | 'play' | 'instant' | 'discard' | 'end';
 export type Zone = 'hand' | 'deck' | 'discard' | 'stable' | 'field' | 'nursery' | 'any';
 export type Scope = 'self' | 'opponent' | 'any_player' | 'all_players';
 
-export type Trigger =
-  | 'immediate'
+/** Триггеры каталога v2 (ровно 19). Рантайм-список: server/src/data/triggers.ts. */
+export type CatalogTrigger =
+  | 'on_any_unicorn_sacrificed_or_destroyed'
+  | 'on_enter_stable'
+  | 'on_leave_stable'
+  | 'on_opponent_play'
+  | 'on_opponent_plays_neigh'
+  | 'on_opponent_plays_spell'
+  | 'on_opponent_plays_unicorn'
+  | 'on_opponent_plays_upgrade_downgrade'
+  | 'on_opponent_pull_baby'
+  | 'on_opponent_sacrifices'
+  | 'on_opponent_unicorn_effect'
+  | 'on_opponent_would_draw'
   | 'on_play'
+  | 'on_turn_end'
+  | 'on_turn_start'
+  | 'on_would_be_destroyed'
+  | 'on_would_be_destroyed_or_sacrificed'
+  | 'when_destroyed'
+  | 'while_in_stable';
+
+/** Legacy-триггеры: движок и импортёр их ещё читают; уйдут в стадии 5 вместе с хардкодом по имени. */
+export type LegacyTrigger =
+  | 'immediate'
   | 'on_discard'
   | 'on_destroy'
-  | 'on_turn_start'
-  | 'on_turn_end'
-  | 'while_in_stable'
   | 'when_other_plays'
   | 'after_resolve'
-  | 'on_enter_stable'
   | 'on_sacrifice'
-  // custom triggers used by importer/game rules
   | 'when_other_unicorn_would_be_sacrificed_or_returned'
   | 'when_other_brings_baby_from_nursery';
+
+export type Trigger = CatalogTrigger | LegacyTrigger;
 
 export type Duration = 'instant' | 'until_end_of_turn' | 'while_in_stable' | 'next_turn' | 'permanent';
 
 export interface Quantity {
-  mode: 'exact' | 'up_to' | 'random' | 'all';
+  /** Необязательно: в данных каталога часто только value. */
+  mode?: 'exact' | 'up_to' | 'random' | 'all';
   value?: number; // required if exact or up_to or random
+  /** Выбирает игрок (is_player_choice в каталоге). */
+  is_player_choice?: boolean;
+  /** Не брать карты с этими тегами (exclude_tags в каталоге). */
+  exclude_tags?: string[];
 }
 
 export interface TargetFilter {
@@ -45,6 +69,11 @@ export interface TargetFilter {
   subtype?: string; // free text tag
   name?: string;
   tags?: string[];
+  /** Не выбирать саму карту-источник (exclude_self в каталоге). */
+  exclude_self?: boolean;
+  id?: string;
+  /** Тип единорога: basic/magical/ultimate/baby; маска в каталоге v2 пока не используется. */
+  unicorn_type?: string;
 }
 
 export interface TargetSelector {
@@ -63,32 +92,59 @@ export type Condition =
   | { kind: 'has_card'; player: Scope; zone: Zone; filter: TargetFilter }
   | { kind: 'flag'; name: string; value?: boolean };
 
-export type ActionKind =
-  | 'add' // move from source to dest (e.g., draw)
-  | 'move' // general move between zones/players
-  | 'transfer' // explicit from one player zone to another
-  | 'destroy'
-  | 'sacrifice'
-  | 'discard'
-  | 'return'
-  | 'steal'
-  | 'give'
-  | 'swap'
-  | 'search'
-  | 'reveal'
-  | 'shuffle_deck'
-  | 'reorder_top'
-  | 'protect'
-  | 'grant_immunity'
-  | 'prevent'
-  | 'ignore'
+/** Условие в свободной форме, как в каталоге v2 ({type,target}, {rules}, {card_group}...). Поведение не меняет. */
+export type LooseCondition = { type?: string; target?: TargetSelector; negate?: boolean; [param: string]: unknown };
+
+/** Виды действий каталога v2: 43 kind (сверено скриптом с catalog.v2.json). */
+export type CatalogActionKind =
+  | 'add'
   | 'cancel'
-  | 'skip_phase'
-  | 'goto_end_turn' // Б1: Носорогорог - немедленный переход к последней фазе хода
+  | 'choice'
+  | 'choose_card_type'
+  | 'choose_players'
+  | 'conditional_loop'
+  | 'copy_effects'
+  | 'destroy'
+  | 'discard'
+  | 'draw'
+  | 'draw_conditional'
+  | 'draw_until_limit'
   | 'extra_action'
+  | 'force_discard'
+  | 'force_play'
+  | 'give'
   | 'limit_actions'
+  | 'mega_shuffle'
+  | 'mill_until'
+  | 'modify_action'
+  | 'modify_hand_limit'
   | 'modify_win_condition'
-  | 'set_flag';
+  | 'move'
+  | 'pass_hands'
+  | 'peek'
+  | 'prevent'
+  | 'pull'
+  | 'reactive_trigger'
+  | 'redirect_target'
+  | 'reorder_top'
+  | 'restrict_action'
+  | 'return'
+  | 'return_to_hand'
+  | 'reveal'
+  | 'sacrifice'
+  | 'scry'
+  | 'search'
+  | 'set_flag'
+  | 'shuffle_deck'
+  | 'skip_phase'
+  | 'skip_turn'
+  | 'steal'
+  | 'swap';
+
+/** Legacy-виды, которых каталог не знает; движок исполняет их и сейчас. */
+export type LegacyActionKind = 'transfer' | 'protect' | 'grant_immunity' | 'ignore' | 'goto_end_turn';
+
+export type ActionKind = CatalogActionKind | LegacyActionKind;
 
 export interface ActionBase {
   kind: ActionKind;
@@ -100,6 +156,12 @@ export interface ActionBase {
    * Use to represent "then"/"if you do" semantics from card text.
    */
   requires_success_of_previous?: boolean;
+  /** Цель действия в форме каталога (target), а не targets/from. */
+  target?: TargetSelector;
+  target_player?: string;
+  quantity?: Quantity;
+  /** Условие исполнения действия (свободная форма каталога). */
+  condition?: Condition | LooseCondition;
 }
 
 export type Action =
@@ -182,6 +244,13 @@ export type Action =
       kind: 'set_flag';
       name: string;
       value: boolean;
+    })
+  | (ActionBase & {
+      /** Виды каталога без своего варианта выше: параметры свободные, исполняет executor. */
+      kind: Exclude<CatalogActionKind, 'add' | 'cancel' | 'destroy' | 'discard' | 'extra_action' | 'give' | 'limit_actions' | 'modify_win_condition' | 'move' | 'prevent' | 'reorder_top' | 'return' | 'reveal' | 'sacrifice' | 'search' | 'set_flag' | 'shuffle_deck' | 'skip_phase' | 'steal' | 'swap'>;
+      target?: TargetSelector;
+      target_player?: string;
+      [param: string]: unknown;
     });
 
 export interface Effect {
@@ -211,6 +280,8 @@ export interface Card {
   deck_count?: number;
   counts_for_win?: boolean;
   blocks_unicorn_effects?: boolean;
+  /** Маска единорога (в каталоге v2 пока нет ни одной карты с маской). */
+  mask?: string;
   skip_phases?: Phase[];
   instant_subtype?: 'neigh' | 'super_neigh' | 'rewind' | 'shield' | 'redirect' | 'intercept';
   /** Супер Нет: эту карту нельзя отменить обычным Neigh и Counter-Neigh. */

@@ -4,7 +4,7 @@ import { GameState, PlayerState, getZoneArray } from './state';
 // Единый расчёт победителя: раньше здесь была третья копия, расходившаяся с gameService
 // (не исключала transforms_unicorn и перерешала уже выставленного победителя).
 import { maybeEndOnDeckEmpty as endGameOnDeckEmpty } from './leader';
-import { isUnicornCard, isCardAvailableFromZone, isMaskedUnicorn, isActionBlockedByMask } from './unicornTypes';
+import { isUnicornCard, cardMatchesGroup, isCardAvailableFromZone, isMaskedUnicorn, isActionBlockedByMask } from './unicornTypes';
 
 // В6-2a/scope: запись о неразобранном селекторе. Форма согласована с Аналитиком:
 // {cardId, mdNum, kind, rawScope, reason} — по ним видно, что именно не сыграло.
@@ -330,22 +330,9 @@ function isUnicornCategory(t: Card['type']): boolean {
   return isUnicornCard(t);
 }
 
+// Делегирует канонический классификатор (учитывает массивы групп из каталога v2).
 function matchesCardGroup(card: Card | undefined, group: any): boolean {
-  if (!card || !group || group === 'any') return true;
-  switch (group) {
-    case 'unicorn':
-      // Единороги: исключаем карты, которые явно помечены как штрафные/не считаются единорогами
-      // (blocks_unicorn_effects=true используется для non_unicorn животных)
-      if ((card as any)?.blocks_unicorn_effects === true) return false;
-      return isUnicornCategory(card.type as any);
-    case 'upgrade':
-    case 'downgrade':
-    case 'instant':
-    case 'magic':
-      return card.type === group;
-    default:
-      return true;
-  }
+  return cardMatchesGroup(card, group);
 }
 
 // Helper: place a found card according to place mode
@@ -399,7 +386,11 @@ export async function triggerEnterEffectsFor(ctx: ResolveContext, owner: PlayerS
   if (!card) return;
   const effects = (Array.isArray((card as any).effects) ? (card as any).effects : []) as Effect[];
   // Входные стоимости для некоторых карт
-  const nameLower = String(((card as any)?.name || (card as any)?.Название || '')).toLowerCase();
+  // Каталог v2 содержит on_enter_stable в данных у 60 карт: для них источник истины — данные,
+  // поэтому хардкод-блок по имени обязан молчать (иначе двойное исполнение). Обнуление nameLower —
+  // одна точка гашения сразу для всех 20 блоков ниже.
+  const hasDataEnter = effects.some((e: any) => e && e.trigger === 'on_enter_stable');
+  const nameLower = hasDataEnter ? '' : String(((card as any)?.name || (card as any)?.Название || '')).toLowerCase();
   // Americorn: при входе — PULL случайную карту из руки оппонента
   if (nameLower.includes('americorn')) {
     const opponents = ctx.state.players.filter(p => p.id !== owner.id);
@@ -586,6 +577,16 @@ export async function triggerEnterEffectsFor(ctx: ResolveContext, owner: PlayerS
   }
   // Generic-цикл: вызов из playCard пропускает его целиком — on_play уже исполнен там (gameService L624–629).
   // on_enter_stable в generic-цикле больше не слушаем: вход в стойло идёт только через хардкод-блоки выше.
+  // Драйвер входа в стойло из данных (вариант 1, решение Аналитика 03.11.2026):
+  // on_enter_stable из каталога исполняется ДО проверки skipGenericLoop, потому что playCard
+  // глушит только generic-цикл on_play, а вход в стойло обязан работать и при skipGenericLoop: true.
+  // optional: true автоматически не исполняем — это выбор игрока, окна выбора на входе пока нет.
+  for (let i = 0; i < effects.length; i++) {
+    const effEnter = effects[i] as any;
+    if (effEnter && effEnter.trigger === 'on_enter_stable' && effEnter.optional !== true) {
+      await resolveEffect(ctx, owner, cardId, effEnter);
+    }
+  }
   if (opts?.skipGenericLoop) return;
   for (let i = 0; i < effects.length; i++) {
     const eff = effects[i] as any;
@@ -1099,6 +1100,8 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
       const chosen = ((ctx as any).currentSourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[(ctx as any).currentSourceId]) || [];
       const owners = getScopePlayers(ctx, player, sel); // scope: any — все владельцы, self — актор
       let moved = 0;
+      // Квота жертвы считается НА ВЛАДЕЛЬЦА: иначе второй игрок не доживает до своей жертвы.
+      const movedBy = new Map<string, number>();
       for (const id of (chosen || []).slice(0, qty)) {
         const owner = owners.find(o => getZoneArrayWithShared(ctx, o, zone).includes(id));
         if (!owner) continue;
@@ -1119,13 +1122,13 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
           zombieKnightReturn(ctx, owner, id);
         }
         moved++;
+        movedBy.set(owner.id, (movedBy.get(owner.id) || 0) + 1);
       }
       for (const owner of owners) {
         const srcArr = getZoneArrayWithShared(ctx, owner, zone);
         // Пропущенные карты (фильтр / маска) не теряем: откладываем и возвращаем на место в исходном порядке.
         const skipped: string[] = [];
-        const ownerBefore = moved; // qty на владельца, а не на всех
-        while (moved - ownerBefore < qty && srcArr.length > 0) {
+        while ((movedBy.get(owner.id) || 0) < qty && srcArr.length > 0) {
           const id = srcArr[srcArr.length - 1];
           const card = ctx.state.cards[id];
           if (!matchesFilter(card as any, (sel as any).filters) || !isTargetableFor('sacrifice', card as any, player.id, owner.id, ctx.state)) {
@@ -1144,6 +1147,7 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
             zombieKnightReturn(ctx, owner, id);
           }
           moved++;
+          movedBy.set(owner.id, (movedBy.get(owner.id) || 0) + 1);
         }
         // Вернуть пропущенные в конец массива (верх стойла) в исходном порядке
         for (const sid of skipped) srcArr.push(sid);
@@ -1805,6 +1809,44 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
       const add = Number(delta);
       if (!Number.isFinite(add) || add <= 0) return false;
       player.action_points = Math.max(0, (player.action_points || 0) + add);
+      return true;
+    }
+    case 'mega_shuffle': {
+      // md 70 «Единорог просто космос»: sources [all_hands, discard, deck] -> destination 'deck'.
+      // Всё перечисленное сгребается в одну колоду и перемешивается (Фишер–Йетс).
+      // Уважаем sources из данных: чего в списке нет — не трогаем.
+      const a = action as any;
+      const sources: string[] = Array.isArray(a.sources) ? a.sources : ['all_hands', 'discard', 'deck'];
+      const dest = String(a.destination || 'deck');
+      const destArr = getZoneArrayWithShared(ctx, player, dest);
+      if (!Array.isArray(destArr)) return false;
+      const gathered: string[] = [];
+      const take = (arr: string[] | undefined) => {
+        if (!Array.isArray(arr) || arr.length === 0) return;
+        for (const id of arr) gathered.push(id);
+        arr.length = 0;
+      };
+      // 'all_hands' — руки всех игроков, включая свои.
+      if (sources.includes('all_hands') || sources.includes('hands')) {
+        for (const p of ctx.state.players) take(p.hand);
+      }
+      // 'discard' — общий сброс и личные сбросы игроков (карты живут в обоих местах).
+      if (sources.includes('discard')) {
+        if (ctx.state.discard) take(ctx.state.discard);
+        for (const p of ctx.state.players) take(p.discard);
+      }
+      // 'deck' — колода (общая в state, иначе личная); берём без зачистки, чтобы не плодить ссылки.
+      if (sources.includes('deck')) {
+        for (const p of ctx.state.players) take(p.deck);
+      }
+      if (gathered.length === 0) return false;
+      for (const id of gathered) destArr.push(id);
+      // Фишер–Йетс по итоговой колоде
+      for (let i = destArr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [destArr[i], destArr[j]] = [destArr[j], destArr[i]];
+      }
+      maybeEndOnDeckEmpty(ctx);
       return true;
     }
     default:

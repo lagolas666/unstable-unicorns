@@ -55,12 +55,12 @@ export function isUnicornCard(type: Card['type'] | string | undefined | null): b
 }
 
 // Малыш достаётся только из Яслей: из колоды и сброса его взять нельзя.
-// Признак берём из данных (source_zone: 'nursery_only', ТЗ §1); пока поля нет в каталоге —
-// фоллбэк на тип baby_unicorn, чтобы правило работало и до заливки поля.
+// Признак берём строго из данных: source_zone === 'nursery_only' (ТЗ по Яслям §1).
+// Фоллбэк по type === 'baby_unicorn' снесён: тип стоит у 95 карт, из них 42 — карты-действия
+// (a_cute_attack, alphalist, baby_trap и др.), и по типу они ошибочно попадали в Ясли.
 export function isNurseryOnly(card: Card | undefined): boolean {
   if (!card) return false;
-  if (String((card as any).source_zone || '') === 'nursery_only') return true;
-  return String((card as any).type || '') === 'baby_unicorn';
+  return String((card as any).source_zone || '') === 'nursery_only';
 }
 
 // Разрешено ли брать эту карту из указанной зоны.
@@ -131,4 +131,25 @@ export const MASK_BLOCKED_ACTION_KINDS = ['sacrifice', 'steal', 'destroy', 'move
 export function isActionBlockedByMask(actionKind: string | undefined): boolean {
   if (!actionKind) return false;
   return (MASK_BLOCKED_ACTION_KINDS as readonly string[]).includes(String(actionKind));
+}
+
+// Тег подтипа карты для filters.subtype из каталога (нормализация, как у .target -> .targets).
+// В catalog.v2.json поле subtype есть только у Магических (["magic"], 70 карт) и Высших (["ultimate"], 16).
+// У Обычных и Малышей поля нет вовсе, поэтому старые теги 'basic' и 'baby_unicorn' в фильтрах
+// не матчились никогда: 17 фильтров из 20 были мёртвыми, а 'magic' падал на сравнении массива со строкой.
+// Тег берём из поля (массив или строка), а при его отсутствии выводим из типа карты.
+// 'baby_unicorn' выдаётся только настоящим Малышам (source_zone === 'nursery_only', 53 карты):
+// у 42 карт-действий (a_cute_attack, baby_trap и др.) тип baby_unicorn, но в Яслях их нет.
+export function cardSubtypeTags(card: Card | undefined): string[] {
+  if (!card) return [];
+  const raw = (card as any).subtype;
+  const list = Array.isArray(raw) ? raw : raw === undefined || raw === null || raw === '' ? [] : [raw];
+  const tags = list.map((v: any) => String(v)).filter((v: string) => v !== '');
+  if (tags.length) return tags;
+  const type = String((card as any).type || '');
+  if (type === 'baby_unicorn') return isNurseryOnly(card) ? ['baby_unicorn'] : [];
+  if (type === 'basic_unicorn') return ['basic'];
+  if (type === 'magical_unicorn') return ['magic'];
+  if (type === 'ultimate_unicorn') return ['ultimate'];
+  return [];
 }

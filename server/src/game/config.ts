@@ -12,6 +12,15 @@ export const WINNING_SCORE_SMALL_GAME = 7;
 /** Порог победы для партии на 6–8 игроков. */
 export const WINNING_SCORE_LARGE_GAME = 6;
 
+/**
+ * Лимит руки на конец хода (правило игры).
+ *
+ * Раньше число 7 было захардкожено в gameService.ts (HAND_LIMIT_BASE) и в движке
+ * не использовалось вовсе: эффект draw_until_limit не знал, до чего добирать.
+ * Теперь цифра живёт здесь, а сервисный слой и движок читают её отсюда.
+ */
+export const HAND_LIMIT_BASE = 7;
+
 /** Минимальное и максимальное число игроков, поддерживаемое движком. */
 export const MIN_PLAYERS = 2;
 export const MAX_PLAYERS = 8;

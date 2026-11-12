@@ -565,7 +565,14 @@ export default function Playtest() {
     setError('');
     try {
       const res = await api.post(`/game/${gameId}/endTurn`);
-      setState(res.data);
+      // BUG-01: при руке больше лимита сервер отвечает { pending, state } — без этой развилки
+      // в state попадал объект окна, и доска пропадала.
+      if (res.data && res.data.state) {
+        setState(res.data.state);
+        if (res.data.pending !== undefined) setPending(res.data.pending);
+      } else {
+        setState(res.data);
+      }
       try { const lr = await api.get(`/game/${gameId}/logs`); setLogs(lr.data); } catch {}
     } catch (e: any) {
       setError(e?.response?.data?.message || e?.message || 'Ошибка окончания хода');

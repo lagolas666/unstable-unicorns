@@ -42,7 +42,25 @@ function entryOf(state: any) {
 // Puppetmaster в руке p1 и три карты у p2 — расклад из awaitChoiceGuard.test.ts.
 function puppetState() {
   const state = mkState();
-  state.cards.pm = { id: 'pm', type: 'basic_unicorn', name: 'Puppetmaster Unicorn', effects: [] };
+  // Две ступени как в хардкоде: discard 1 себе, и только при успехе — force_discard 2 соперникам.
+  state.cards.pm = {
+    id: 'pm',
+    type: 'basic_unicorn',
+    name: 'Кукловод',
+    effects: [
+      {
+        trigger: 'on_enter_stable',
+        actions: [
+          { kind: 'discard', target: { scope: 'self', zone: 'hand', quantity: { value: 1 } } },
+          {
+            kind: 'force_discard',
+            requires_success_of_previous: true,
+            target: { scope: 'other', zone: 'hand', quantity: { value: 2 } },
+          },
+        ],
+      },
+    ],
+  };
   for (const k of ['a', 'x', 'y', 'z']) state.cards[k] = { id: k, type: 'basic_unicorn', name: k, effects: [] };
   state.players[0].hand = ['pm', 'a'];
   state.players[1].hand = ['x', 'y', 'z'];

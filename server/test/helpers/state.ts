@@ -27,7 +27,7 @@ export function unicorn(id: string, name?: string) {
   return { id, type: 'basic_unicorn', name: name ?? id } as any;
 }
 
-export function baseTurn(currentPlayerId: string, phase: 'action' | 'draw' | 'end' = 'action', has_drawn = false) {
+export function baseTurn(currentPlayerId: string, phase: 'begin_turn' | 'action' | 'draw' | 'end' = 'action', has_drawn = false) {
   return { currentPlayerId, phase, has_drawn } as any;
 }
 

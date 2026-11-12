@@ -1,0 +1,14 @@
+393:   // REST playerId не передаёт — подставляем текущего, чужие ходы отсекает сервис
+394:   const playerId = String(req.body?.playerId || '') || entry.state.turn.currentPlayerId;
+395:   const result = await drawCard(String(req.params.id), playerId, { via: 'rest' });
+396:   if (!result.ok) {
+397:     // D1: extra несёт признак оконченной партии ({ gameOver, winnerId })
+398:     const payload: any = { message: result.message };
+399:     if (result.extra) Object.assign(payload, result.extra);
+400:     return res.status(result.http).json(payload);
+401:   }
+402:   const state = result.state;
+403:   try {
+404:     const io: any = (req.app as any).get('io');
+405:     io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+406:     io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', result.logs.slice(-100));

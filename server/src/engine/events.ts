@@ -14,7 +14,9 @@ export type GameEvent =
   | { type: 'phase_started'; phase: GamePhase; player: PlayerRef }
   | { type: 'card_played'; card: CardRef; player: PlayerRef }
   | { type: 'effect_triggered'; effect: Effect; source: CardRef; trigger: Trigger; player: PlayerRef }
-  | { type: 'action_resolved'; action: Action; success: boolean };
+  | { type: 'action_resolved'; action: Action; success: boolean }
+  // Решафл сброса в колоду при доборе эффектом (правило UU): size — размер новой колоды.
+  | { type: 'reshuffle'; size: number };
 
 export interface EventListener {
   (event: GameEvent): void;

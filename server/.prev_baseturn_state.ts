@@ -1,0 +1,48 @@
+// Common state builders for tests
+export type PlayerInit = Partial<{
+  id: string;
+  deck: string[];
+  hand: string[];
+  discard: string[];
+  stable: string[];
+  nursery: string[];
+  field: string[];
+  action_points: number;
+}> & { id: string };
+
+export function player(p: PlayerInit) {
+  return {
+    id: p.id,
+    deck: p.deck ?? [],
+    hand: p.hand ?? [],
+    discard: p.discard ?? [],
+    stable: p.stable ?? [],
+    nursery: p.nursery ?? [],
+    field: p.field ?? [],
+    action_points: p.action_points ?? 1,
+  } as any;
+}
+
+export function unicorn(id: string, name?: string) {
+  return { id, type: 'basic_unicorn', name: name ?? id } as any;
+}
+
+export function baseTurn(currentPlayerId: string, phase: 'action' | 'draw' | 'end' = 'action', has_drawn = false) {
+  return { currentPlayerId, phase, has_drawn } as any;
+}
+
+export function gameState({
+  players,
+  cards,
+  turn,
+  deck = [],
+  discard = [],
+}: {
+  players: any[];
+  cards: Record<string, any>;
+  turn: any;
+  deck?: string[];
+  discard?: string[];
+}) {
+  return { players, cards, turn, deck, discard } as any;
+}

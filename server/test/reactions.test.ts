@@ -1162,8 +1162,9 @@ describe('Reaction chains: neigh/super_neigh/counter_neigh', () => {
     const final = await getState(gameId);
     const a = final.players.find((p: any) => p.id === A);
     const b = final.players.find((p: any) => p.id === B);
-    // Card destroy should remain in A's hand (not played)
-    expect(a.hand).toContain(destroy);
+    // Отменённая карта израсходована: уходит в сброс владельца (BUG-02, правило Neigh)
+    expect(a.discard).toContain(destroy);
+    expect(a.hand).not.toContain(destroy);
     // Neigh instant goes to B's discard
     expect(b.discard).toContain(neigh);
     // Target still in B's stable (destroy did not resolve)
@@ -1255,7 +1256,8 @@ describe('Reaction chains: neigh/super_neigh/counter_neigh', () => {
     const final = await getState(gameId);
     const a = final.players.find((p: any) => p.id === A);
     const b = final.players.find((p: any) => p.id === B);
-    expect(a.hand).toContain(destroy);
+    expect(a.discard).toContain(destroy);
+    expect(a.hand).not.toContain(destroy);
     expect(b.discard).toContain(sneigh);
     expect(b.stable).toContain(t1);
     expect(final.discard).not.toContain(destroy);
@@ -1645,7 +1647,8 @@ describe('Redirect combinations', () => {
     const final = await getState(gameId);
     const a = final.players.find((p: any) => p.id === A);
     const b = final.players.find((p: any) => p.id === B);
-    expect(a.hand).toContain(destroy);
+    expect(a.discard).toContain(destroy);
+    expect(a.hand).not.toContain(destroy);
     expect(final.discard).not.toContain(destroy);
     expect(b.discard).toContain(red);
     expect(b.discard).toContain(neigh);
@@ -1875,8 +1878,9 @@ describe('Super Neigh in long chains', () => {
     const final = await getState(gameId);
     const a = final.players.find((p: any) => p.id === A)!;
     const b = final.players.find((p: any) => p.id === B)!;
-    // canceled: destroy card back to A's hand, no destroy in shared discard
-    expect(a.hand).toContain(destroy);
+    // canceled: destroy card израсходована в сброс A, в общем сбросе её нет
+    expect(a.discard).toContain(destroy);
+    expect(a.hand).not.toContain(destroy);
     expect(final.discard).not.toContain(destroy);
     // redirect and super_neigh are discarded by B, targets intact
     expect(b.discard).toEqual(expect.arrayContaining([red, sneigh]));
@@ -1934,8 +1938,9 @@ describe('Super Neigh in long chains', () => {
     const final = await getState(gameId);
     const a = final.players.find((p: any) => p.id === A)!;
     const b = final.players.find((p: any) => p.id === B)!;
-    // canceled entirely
-    expect(a.hand).toContain(destroy);
+    // canceled entirely: карта A израсходована в его сброс
+    expect(a.discard).toContain(destroy);
+    expect(a.hand).not.toContain(destroy);
     expect(final.discard).not.toContain(destroy);
     // All instants used should be in B's discard (including redirect + neigh + super_neigh)
     expect(b.discard).toEqual(expect.arrayContaining([red, neigh, sneigh]));

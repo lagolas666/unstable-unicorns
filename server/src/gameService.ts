@@ -1,12 +1,13 @@
-﻿﻿import { EventBus } from './engine/events';
+import { EventBus } from './engine/events';
 import { GameState, PlayerState } from './engine/state';
-import { resolveEffect, ResolveContext, resolveActions, executeForceDiscard, maybeInterceptMagicToHand } from './engine/executor';
+import { resolveEffect, ResolveContext, resolveActions, executeForceDiscard, maybeInterceptMagicToHand, completeDeferredDestroy, updateStableEffects } from './engine/executor';
 import { Card, Effect } from '../../shared/src/types';
 import { games, LogEntry, Pending } from './gameStore';
+import { handLimitFor } from './engine/handLimit';
 // Единый расчёт победителя живёт в engine/leader.ts: сервис и engine/executor используют его же,
 // чтобы не держать двух реализаций тай-брейкера.
 import { isUnicorn, countUnicornsForWin, leaderByUnicorns, maybeEndOnDeckEmpty } from './engine/leader';
-import { isUnicornCard, cardMatchesGroup } from './engine/unicornTypes';
+import { isUnicornCard, cardMatchesGroup, cardSubtypeTags } from './engine/unicornTypes';
 // Порог победы считается от числа игроков: 2–5 → 7, 6–8 → 6 (src/game/config.ts).
 // Своя копия числа здесь недопустима — из-за дублей правило «6 при 6–8» не работало.
 import { getWinningScore, MIN_PLAYERS, MAX_PLAYERS } from './game/config';
@@ -16,7 +17,7 @@ export { isUnicorn, countUnicornsForWin, leaderByUnicorns, maybeEndOnDeckEmpty }
 // и завершения хода. REST-роуты и (на следующем этапе) socket-слой зовут одно и то же.
 
 // Helper: detect if a card has effects that should open a reaction window
-import { triggerEnterEffectsFor } from './engine/executor';
+import { triggerEnterEffectsFor, swapCandidatesFor } from './engine/executor';
 
 export function hasDangerousEffect(card: any): boolean {
   const effects = (card?.effects as any[]) || [];
@@ -25,6 +26,56 @@ export function hasDangerousEffect(card: any): boolean {
   );
 }
 
+// BUG-SWAP-04 (07.11.2026): «игрока выбирает игрок» — токены каталога v2. Сравнений по имени
+// карты нет: требование выбора распознаётся по данным (destination_player в действии swap).
+export const CHOSEN_PLAYER_TOKENS: string[] = ['chosen', 'chosen_other', '$chosen_players'];
+
+// Рекурсивный обход действий эффекта: swap может лежать внутри choice.options[].actions.
+function collectActionsDeep(actions: any[], out: any[] = []): any[] {
+  for (const a of actions || []) {
+    if (!a || typeof a !== 'object') continue;
+    out.push(a);
+    if (Array.isArray(a.options)) for (const o of a.options) collectActionsDeep(o?.actions, out);
+    if (Array.isArray(a.actions)) collectActionsDeep(a.actions, out);
+  }
+  return out;
+}
+
+// Требование транспорта для карт с обменом, где сторону выбирает игрок:
+//  - candidates — соперники, у которых в зоне назначения есть карта, проходящая фильтр обмена;
+//    счёт делает движок (executor.swapCandidatesFor) тем же matchesFilter, что и исполнение;
+//  - required — кандидатов больше одного, автоподбор движка (executor.swapOpponentCandidates)
+//    вернёт undefined, и розыгрыш без явного выбора обязан получить 409, а не «успех без эффекта»;
+//  - swapOnly — все действия триггера розыгрыша это swap: при отказе мутаций не было,
+//    поэтому вернуть карту в руку безопасно.
+export function swapChoiceRequirement(
+  state: GameState,
+  player: PlayerState,
+  card: any,
+): { candidates: string[]; required: boolean; swapOnly: boolean } | null {
+  const effects = ((card as any)?.effects as any[]) || [];
+  let chosenSwap: any | undefined;
+  let actionCount = 0;
+  let swapCount = 0;
+  for (const ef of effects) {
+    if (ef?.trigger !== 'on_play' && ef?.trigger !== 'immediate') continue;
+    const all = collectActionsDeep(Array.isArray(ef.actions) ? ef.actions : []);
+    for (const a of all) {
+      actionCount++;
+      if (String(a.kind) !== 'swap') continue;
+      swapCount++;
+      const dp = String((a as any).destination_player ?? 'self');
+      if (!chosenSwap && CHOSEN_PLAYER_TOKENS.includes(dp)) chosenSwap = a;
+    }
+  }
+  if (!chosenSwap) return null;
+  // BUG-SWAP-05-follow-up (07.11.2026): кандидатов считает движок тем же matchesFilter, что и
+  // автоподбор в executor.swapOpponentCandidates. Своё «зона не пуста» здесь давало окно выбора
+  // на соперника без подходящих карт: выбор проходил guard, исполнитель отказывал, транспорт
+  // отдавал 409 в уже открытое окно.
+  const candidates = swapCandidatesFor(state, player.id, chosenSwap);
+  return { candidates, required: candidates.length > 1, swapOnly: actionCount > 0 && actionCount === swapCount };
+}
 // Helper: detect if a unicorn has any on_play/immediate effects (to allow Hypnorog reaction window)
 export function hasUnicornOnPlayEffect(card: any): boolean {
   if (!card) return false;
@@ -33,6 +84,17 @@ export function hasUnicornOnPlayEffect(card: any): boolean {
   if (!isUni) return false;
   const effects = (card?.effects as any[]) || [];
   return effects.some((ef: any) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions));
+}
+
+// Единая точка закрытия окна: pending снимается вместе со своим таймером,
+// иначе висящий setTimeout держит процесс (Jest did not exit).
+export function closePending(entry: any) {
+  if (!entry) return;
+  if (entry.pendingTimeout) {
+    try { clearTimeout(entry.pendingTimeout); } catch {}
+    entry.pendingTimeout = null;
+  }
+  entry.pending = null as any;
 }
 
 // Helper: schedule auto-resolution of a pending play after a timeout; resets existing timer
@@ -57,6 +119,15 @@ export function schedulePendingResolution(gameId: string, delayMs: number = 5000
       e.pending = null as any;
       return;
     }
+    if (p.kind === 'await_choice' && p.purpose === 'archangel_prevent') {
+      // Замена уничтожения: владелец не ответил за окно — отказ, уничтожение проходит штатно.
+      await resolveArchangelWindow(gameId, p, null);
+      return;
+    }
+    if (p.kind === 'await_choice' && p.purpose === 'hand_limit') {
+      // BUG-01: лимит руки — выбирает только игрок. Окно не закрываем и карту не берём.
+      return;
+    }
     if (p.kind === 'await_choice') {
       // Защитник не ответил за 5 с: автоподбор случайной карты из руки (как прежний случайный сброс).
       const chooser = e.state.players.find((pp) => pp.id === p.chooserId);
@@ -67,10 +138,10 @@ export function schedulePendingResolution(gameId: string, delayMs: number = 5000
       return;
     }
     if (p.kind === 'play') {
-      // Отменено (cancelLevel > 0): карта остаётся в руке, кроме случая перемотки —
-      // тогда она уходит на верх колоды (правило Даниила).
+      // Отменено (cancelLevel > 0): обычная отмена отправляет карту в сброс владельца,
+      // перемотка — на верх колоды (правило Даниила). Логика общая с resolvePendingNow.
       if ((p.cancelLevel || 0) > 0) {
-        moveRewoundPlayToDeck(e.state, p);
+        resolveCancelledPlay(e.state, p);
         e.pending = null as any;
         return;
       }
@@ -97,7 +168,7 @@ export function schedulePendingResolution(gameId: string, delayMs: number = 5000
       }
       // Otherwise execute the effect for actor
       const actor = e.state.players.find(pp => pp.id === p.actorId)!;
-      const ctx: ResolveContext = { state: e.state, bus: e.bus } as any;
+      const ctx: ResolveContext = { state: e.state, bus: e.bus, logs: e.logs } as any;
       if (p.preTargets?.length) {
         (ctx as any).selectedTargets = (ctx as any).selectedTargets || {};
         (ctx as any).selectedTargets[p.sourceCardId] = p.preTargets;
@@ -138,7 +209,7 @@ export function schedulePendingResolution(gameId: string, delayMs: number = 5000
         return;
       }
       const actor = e.state.players.find(pp => pp.id === p.actorId)!;
-      const ctx: ResolveContext = { state: e.state, bus: e.bus } as any;
+      const ctx: ResolveContext = { state: e.state, bus: e.bus, logs: e.logs } as any;
       // Apply preselected targets/players if any
       if (p.preTargets?.length) {
         (ctx as any).selectedTargets = (ctx as any).selectedTargets || {};
@@ -174,7 +245,8 @@ export function schedulePendingResolution(gameId: string, delayMs: number = 5000
   }, delayMs);
 }
 
-export const HAND_LIMIT_BASE = 7;
+// Лимит руки объявлен в game/config.ts; здесь реэкспорт ради routes/game.ts (L15).
+export { HAND_LIMIT_BASE } from './game/config';
 // Оставлено только для совместимости: routes/game.ts импортирует константу (L15).
 // Порог победы в checkWin считается через getWinningScore(playerCount), а не отсюда.
 export const WIN_UNICORNS_BASE = 7;
@@ -185,15 +257,9 @@ export function matchesCardGroup(card: any, group?: unknown): boolean {
 }
 
 export function currentHandLimit(state: GameState, player: PlayerState): number {
-  // Aggregate simple per-player modifiers from cards in their stable
-  let delta = 0;
-  for (const cid of player.stable) {
-    const c = state.cards[cid] as any;
-    if (!c) continue;
-    const d = Number(c?.hand_limit_delta || 0);
-    if (!Number.isNaN(d)) delta += d;
-  }
-  return Math.max(0, HAND_LIMIT_BASE + delta);
+  // В6-3a/3-C: лимит руки считается в одном месте — engine/handLimit.ts.
+  // Своя копия формулы здесь была дублем (та же сумма hand_limit_delta по стойлу).
+  return handLimitFor(state, player);
 }
 
 export function checkWin(state: GameState): string | null {
@@ -247,6 +313,8 @@ export function ctxFor(id: string): { ctx: ResolveContext; current: PlayerState 
   const ctx: ResolveContext = {
     state: g.state,
     bus: g.bus,
+    // журнал партии: события движка без своего канала (решафл сброса) пишутся сюда
+    logs: g.logs,
   } as any;
   // Прокидываем колбэк для инициирования окна реакций триггеров
   (ctx as any).requestReactionWindow = (params: { trigger: 'when_destroyed' | 'when_enters'; actorId: string; sourceCardId: string; effectIdx: number; uncounterable?: boolean; allow_intercept?: boolean; }) => {
@@ -309,7 +377,7 @@ export function ctxFor(id: string): { ctx: ResolveContext; current: PlayerState 
   };
   // Окно выбора защитника (force_discard, Puppetmaster). Открываем, если нет другого окна, кроме play
   // (play перекрываем, как и requestReactionWindow). Иначе false — движок сбросит карту сам.
-  (ctx as any).requestChoice = (params: { actorId: string; chooserId: string; sourceCardId: string | null; options: string[]; remaining: number; done: string[] }): boolean => {
+  (ctx as any).requestChoice = (params: { actorId: string; chooserId: string; sourceCardId: string | null; options: string[]; remaining: number; done: string[]; purpose?: string }): boolean => {
     const entry = g;
     if (!entry) return false;
     if (entry.pending && (entry.pending as any).kind !== 'play') return false;
@@ -321,6 +389,8 @@ export function ctxFor(id: string): { ctx: ResolveContext; current: PlayerState 
       options: params.options,
       remaining: params.remaining,
       done: params.done,
+      purpose: params.purpose,
+      deferred: (params as any).deferred,
       expiresAt: Date.now() + 5000,
     } as any;
     entry.logs.push({ t: Date.now(), type: 'debug', details: { where: 'requestChoice', event: 'await_choice', chooserId: params.chooserId, options: params.options, remaining: params.remaining } } as any);
@@ -464,7 +534,7 @@ export async function performPlayNow(entry: { state: GameState; bus: EventBus; l
       }
     }
   }
-  // Вход в стойло: хардкод-блоки карты (тот же контракт, что в playCard). on_play уже отработан выше.
+  // Вход в стойло: эффект входа исполняется из данных (effects.on_enter_stable). on_play уже отработан выше.
   if (!hypnoCanceledExec && ctype !== 'magic' && ctype !== 'instant') {
     await triggerEnterEffectsFor(ctxFinal as any, player, cardId, { skipGenericLoop: true });
   }
@@ -507,7 +577,7 @@ export type PlayResult =
   | { ok: true; state: GameState; logs: LogEntry[]; pending?: any; openedWindow: boolean }
   | ServiceError;
 
-export type EndTurnResult = { ok: true; state: GameState; logs: LogEntry[] } | ServiceError;
+export type EndTurnResult = { ok: true; state: GameState; logs: LogEntry[]; pending?: any } | ServiceError;
 
 function fail(code: ServiceErrorCode, message: string, http: number, extra?: any): ServiceError {
   return { ok: false, code, message, http, extra };
@@ -567,6 +637,8 @@ export async function playCard(
 
   // Карты с destroy/steal/sacrifice требуют явной цели
   const card = state.cards[cardId];
+  // Регистрируем безусловные эффекты источников, находящихся в стойлах.
+  updateStableEffects(state);
   const effects = ((card as any)?.effects as any[]) || [];
   const needsTargetEffect = effects.find(
     (ef) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions) && ef.actions.some((a: any) => ['destroy', 'steal', 'sacrifice'].includes(a.kind))
@@ -651,6 +723,43 @@ export async function playCard(
     prefillTargets = requested;
     if (opts?.targetPlayerId) prefillPlayer = String(opts.targetPlayerId);
   }
+  // BUG-SWAP-04: карта требует выбора СОПЕРНИКА (destination_player:chosen у действия swap).
+  // Проверка стоит ДО изъятия карты из руки и ДО списания очка действия, поэтому отказ не
+  // мутирует состояние. Раньше /play отвечал 200, карта уходила в сброс, обмена не было.
+  const swapReq = swapChoiceRequirement(state, player, card);
+  let swapChosen: string | undefined;
+  if (swapReq) {
+    if (swapReq.candidates.length === 0) {
+      // BUG-SWAP-05: обменять нечего ни с кем — отказ терминальный. options.players здесь
+      // отдавать нельзя: в список попадали соперники с пустой зоной обмена, клиент открывал
+      // окно выбора, а повторный /play с таким targetPlayerId падал в 400. needTargets тоже
+      // не ставим — иначе UI снова предложит выбор. Карта в руке, очко действия не списано.
+      return fail('BAD_REQUEST', 'No opponent can swap cards', 409, { noSwapCandidates: true });
+    }
+    const selRaw = opts?.targetPlayerId ? String(opts.targetPlayerId) : '';
+    if (selRaw) {
+      if (!swapReq.candidates.includes(selRaw)) {
+        return fail('BAD_REQUEST', 'Invalid target player', 400, {
+          invalid: selRaw,
+          kind: 'players',
+          options: { players: swapReq.candidates },
+        });
+      }
+      swapChosen = selRaw;
+    } else if (swapReq.required) {
+      // Кандидатов несколько, выбор не передан — окно выбора игрока, состояние не меняем.
+      return fail('BAD_REQUEST', 'Opponent target required', 409, {
+        needTargets: true,
+        kind: 'players',
+        options: { players: swapReq.candidates },
+      });
+    } else {
+      // Ровно один подходящий соперник — автоподбор движка сработает и без выбора.
+      swapChosen = swapReq.candidates[0];
+    }
+    // Выбор обязан доехать до исполнения через окно реакции (prefill.playerId).
+    if (swapChosen && !prefillPlayer) prefillPlayer = swapChosen;
+  }
   // цель upgrade/downgrade тоже уходит в окно реакций, иначе теряется после резолва
   if (attachTargetPlayer && !prefillPlayer) {
     prefillPlayer = attachTargetPlayer;
@@ -680,6 +789,12 @@ export async function playCard(
   // Временно убираем из руки, в стойло кладём только после оплаты стоимости
   player.hand.splice(idx, 1);
   const { ctx } = ctxFor(gameId)!;
+  // BUG-SWAP-04: на прямом пути (без окна реакции) исполнитель читает выбор игрока из
+  // ctx.selectedPlayers[currentSourceId]. Без этой строки swap с выбранным соперником не
+  // обменивал руки и молча возвращал false.
+  if (swapChosen) {
+    (ctx as any).selectedPlayers = { ...(((ctx as any).selectedPlayers as any) || {}), [cardId]: swapChosen };
+  }
 
   // Оплата стоимости карты
   const costs2 = (card as any)?.play_requirements?.costs as any[] | undefined;
@@ -730,6 +845,14 @@ export async function playCard(
     player.stable.push(cardId);
   }
 
+  // BUG-SWAP-04 (требование 3): отказ исполнителя на swap не должен стоить игроку карты и
+  // очка действия. executor.ts не правим — отказ виден по событию шины action_resolved
+  // (resolveEffect L728/L733 шлёт его и на «действие невозможно», и на «исполнение вернуло false»).
+  let swapRefused = false;
+  const onSwapOutcome = (ev: any) => {
+    if (ev && ev.type === 'action_resolved' && ev.action && String(ev.action.kind) === 'swap' && ev.success === false) swapRefused = true;
+  };
+  (entry.bus as any).on(onSwapOutcome);
   // on_play/immediate, если Hypnorog не отменил эффекты
   const pLocal = entry.pending as any;
   const hypnoCanceled = !!(pLocal && pLocal.kind === 'play' && pLocal.cardId === cardId && pLocal.hypnorog && pLocal.hypnorog.cancel);
@@ -741,10 +864,21 @@ export async function playCard(
       }
     }
   }
-  // Вход в стойло: хардкод-блоки карты (Americorn, Zombie Knight, Puppetmaster и др.).
+  // Вход в стойло: эффект входа исполняется из данных (effects.on_enter_stable).
   // on_play отработан выше, поэтому generic-цикл пропускаем. Магия и инстант в стойло не входят.
   if (!hypnoCanceled && ctype !== 'magic' && ctype !== 'instant') {
     await triggerEnterEffectsFor(ctx, player, cardId, { skipGenericLoop: true });
+  }
+  (entry.bus as any).off(onSwapOutcome);
+  // Отказ swap на карте, весь розыгрыш которой состоит из swap: мутаций не было, карта
+  // возвращается в руку, очко действия не тратится, клиент получает 409 с окном выбора.
+  if (swapRefused && swapReq && swapReq.swapOnly && (ctype === 'magic' || ctype === 'instant')) {
+    player.hand.push(cardId);
+    return fail('BAD_REQUEST', 'Opponent target required', 409, {
+      needTargets: true,
+      kind: 'players',
+      options: { players: swapReq.candidates },
+    });
   }
   // magic/instant уходят в общий сброс — как в performPlayNow, иначе карта аннигилируется
   if (ctype === 'magic' || ctype === 'instant') {
@@ -777,6 +911,14 @@ export async function endTurn(gameId: string): Promise<EndTurnResult> {
     if (over) return over;
   }
   const current = state.players.find((p) => p.id === state.turn.currentPlayerId)!;
+  // BUG-01: окно самосброса уже открыто — эффекты конца хода повторно не исполняем,
+  // иначе on_turn_end сработал бы дважды за один ход. Отдаём то же окно.
+  {
+    const pend: any = entry.pending;
+    if (pend && pend.kind === 'await_choice' && pend.purpose === 'hand_limit') {
+      return { ok: true, state, logs: entry.logs, pending: pend };
+    }
+  }
   const { ctx } = ctxFor(gameId)!;
   // Эффекты on_turn_end текущего игрока
   let resolved = 0;
@@ -791,18 +933,51 @@ export async function endTurn(gameId: string): Promise<EndTurnResult> {
     }
   }
 
-  // Лимит руки: завершить ход нельзя, если рука переполнена
+  // Лимит руки: ход не передаём, пока рука > лимита. Игрок сам выбирает, что сбросить
+  // (правило UU). Авто-сброса нет: открываем окно await_choice purpose 'hand_limit'.
   const limit = currentHandLimit(state, current);
   if (current.hand.length > limit) {
-    return fail('BAD_REQUEST', `Hand limit exceeded: ${current.hand.length}/${limit}`, 400);
+    openHandLimitWindow(gameId, current, limit);
+    return { ok: true, state, logs: entry.logs, pending: entry.pending };
   }
+  return finishTurn(gameId, entry, current, resolved);
+}
+
+// Окно самосброса по лимиту руки: сколько живёт окно до повторной проверки (карту не берёт).
+const HAND_LIMIT_WINDOW_MS = 5000;
+
+// Окно самосброса по лимиту руки (BUG-01). chooser = актор = текущий игрок.
+// Таймер для purpose 'hand_limit' карту не выбирает и окно не закрывает (см. schedulePendingResolution).
+function openHandLimitWindow(gameId: string, current: PlayerState, limit: number): void {
+  const entry = games.get(gameId);
+  if (!entry) return;
+  const remaining = current.hand.length - limit;
+  entry.pending = {
+    kind: 'await_choice',
+    purpose: 'hand_limit',
+    actorId: current.id,
+    chooserId: current.id,
+    sourceCardId: null,
+    options: current.hand.slice(),
+    remaining,
+    done: [],
+    expiresAt: Date.now() + HAND_LIMIT_WINDOW_MS,
+  } as any;
+  entry.logs.push({ t: Date.now(), type: 'debug', details: { where: 'endTurn', event: 'await_choice', purpose: 'hand_limit', chooserId: current.id, remaining } } as any);
+  // Окно должно быть живым: таймер поднимается, но карту за игрока не выбирает.
+  schedulePendingResolution(gameId, HAND_LIMIT_WINDOW_MS);
+}
+
+// Хвост конца хода: победа, снятие флагов, передача хода. Вызывается и из endTurn, и из finishAwaitChoice.
+function finishTurn(gameId: string, entry: any, current: PlayerState, resolved: number): EndTurnResult {
+  const { state } = entry;
   // Победа после эффектов конца хода (до передачи хода)
   const winnerEnd = checkWin(state);
   // Победитель уже объявлен — не перезаписываем (winnerId = защёлка)
   if (winnerEnd && !(state as any).winnerId) (state as any).winnerId = winnerEnd;
 
   current.noNeighUntilEndOfTurn = false; // Objection: запрет Ржаний снимается в конце хода владельца
-  const idx = state.players.findIndex((p) => p.id === state.turn.currentPlayerId);
+  const idx = state.players.findIndex((p: PlayerState) => p.id === state.turn.currentPlayerId);
   const next = state.players[(idx + 1) % state.players.length];
   state.turn.currentPlayerId = next.id;
   state.turn.phase = 'begin_turn';
@@ -1022,7 +1197,7 @@ export function canReact(state: GameState, pending: any, reactorId: string, inst
 export async function reactRedirect(gameId: string, body: any = {}, io?: any): Promise<RouteOutcome> {
   return runReaction(gameId, body, io, 'reactRedirect', async (req: any, res: any) => {
       const entry = games.get(req.params.id);
-      if (!entry) return res.status(404).json({ message: 'Game not found' });
+      if (!entry) return res.status(404).json({ message: 'Game not found', code: 'GAME_NOT_FOUND' });
       const { state } = entry;
       let pending = entry.pending as any;
       if (!pending || (pending.kind !== 'play' && pending.kind !== 'trigger_effect' && pending.kind !== 'turn_start_effect'))
@@ -1633,6 +1808,25 @@ export async function reactHypnorog(gameId: string, body: any = {}, io?: any): P
 }
 
 /**
+ * Закрытие отменённого розыгрыша (cancelLevel > 0). Точки вызова обязаны быть общими:
+ * таймер окна (schedulePendingResolution) и явный resolvePendingNow. Две копии логики
+ * разъехались — карта отменённого Neigh оставалась в руке (BUG-02, e2e A5).
+ * Перемотка (rewindPlayCancel) возвращает карту на верх колоды (правило Даниила),
+ * обычная отмена (Neigh / Super Neigh) отправляет её в сброс владельца:
+ * «Stop that player's card from being played and send it to the discard pile».
+ */
+function resolveCancelledPlay(state: GameState, pend: any): void {
+  if (!pend) return;
+  if (pend.rewindPlayCancel) { moveRewoundPlayToDeck(state, pend); return; }
+  const actor = state.players.find(p => p.id === pend.actorId);
+  if (!actor) return;
+  const idx = actor.hand.indexOf(pend.cardId);
+  if (idx === -1) return;
+  actor.hand.splice(idx, 1);
+  actor.discard.push(pend.cardId);
+}
+
+/**
  * Перемотка отменила розыгрыш: карта уходит из руки актёра на верх колоды.
  * Верх колоды — конец массива (executor делает deck.pop()).
  */
@@ -1990,6 +2184,31 @@ export async function reactObjection(gameId: string, body: any = {}, io?: any): 
   });
 }
 
+// Окно замены уничтожения/жертвы Архангелом (purpose 'archangel_prevent'). Отвечает владелец карты.
+// cardId — владелец сбрасывает карту из руки, цель остаётся в стойле.
+// null — отказ или таймаут: уничтожение проходит штатно (completeDeferredDestroy).
+// Окно закрывается до продолжения.
+export async function resolveArchangelWindow(gameId: string, pending: any, cardId: string | null): Promise<void> {
+  const entry = games.get(gameId);
+  if (!entry) return;
+  const owner = entry.state.players.find((p) => p.id === pending.chooserId);
+  const deferred = pending.deferred || null;
+  closePending(entry);
+  if (!owner) return;
+  if (cardId) {
+    const idx = owner.hand.indexOf(cardId);
+    if (idx === -1) return;
+    owner.hand.splice(idx, 1);
+    owner.discard.push(cardId);
+    entry.logs.push({ t: Date.now(), type: 'debug', details: { event: 'archangel_prevent', decision: 'replace', chooserId: owner.id, cardId, replacerId: pending.sourceCardId ?? null, targetCardId: deferred?.cardId ?? null } } as any);
+    return;
+  }
+  if (!deferred) return;
+  entry.logs.push({ t: Date.now(), type: 'debug', details: { event: 'archangel_prevent', decision: 'decline', chooserId: owner.id, targetCardId: deferred.cardId, kind: deferred.kind } } as any);
+  const { ctx } = ctxFor(gameId)!;
+  await completeDeferredDestroy(ctx, owner, deferred.zone, deferred.cardId, deferred.kind);
+}
+
 /** POST /api/game/:id/resolvePending */
 // Завершение окна await_choice: защитник сбрасывает выбранную карту, затем цепочка force_discard продолжается.
 // Окно снимаем до продолжения, иначе новое окно упрётся в «уже открыто» (requestChoice).
@@ -2005,7 +2224,17 @@ export function finishAwaitChoice(gameId: string, pending: any, cardId: string, 
   const { ctx } = ctxFor(gameId)!;
   maybeInterceptMagicToHand(ctx, chooser, cardId);
   entry.logs.push({ t: Date.now(), type: 'debug', details: { event: 'force_discard', chooserId: chooser.id, cardId, chosenByPlayer, remaining: pending.remaining } } as any);
-  entry.pending = null as any;
+  closePending(entry);
+  if (pending.purpose === 'hand_limit') {
+    // BUG-01: самосброс по лимиту. Рука > лимита — окно переоткрываем, иначе завершаем ход.
+    const limitNow = currentHandLimit(entry.state, chooser);
+    if (chooser.hand.length > limitNow) {
+      openHandLimitWindow(gameId, chooser, limitNow);
+    } else {
+      finishTurn(gameId, entry, chooser, 0);
+    }
+    return;
+  }
   const owner = entry.state.players.find((p) => p.id === pending.actorId);
   const left = Number(pending.remaining) || 0;
   if (owner && left > 0) {
@@ -2022,7 +2251,7 @@ export async function resolvePendingNow(gameId: string, body: any = {}, io?: any
       if (!entry) return res.status(404).json({ message: 'Game not found' });
       const { state } = entry;
       const pending = entry.pending;
-      if (!pending || (pending.kind !== 'play' && pending.kind !== 'turn_start_effect' && pending.kind !== 'trigger_effect' && (pending as any).kind !== 'await_choice')) return res.status(400).json({ message: 'Nothing pending' });
+      if (!pending || (pending.kind !== 'play' && pending.kind !== 'turn_start_effect' && pending.kind !== 'trigger_effect' && (pending as any).kind !== 'await_choice')) return res.status(400).json({ message: 'Nothing pending', code: 'nothing_pending' });
       // Окно реакции закрывает только его актор: посторонний не должен закрывать чужое окно
       // и тем лишать соперников права сыграть Neigh (дефект класса #50, путь resolve_pending).
       // Socket-путь всегда передаёт byPlayerId и требует его (handlers.ts, событие resolve_pending).
@@ -2032,19 +2261,19 @@ export async function resolvePendingNow(gameId: string, body: any = {}, io?: any
       // Для await_choice отвечает защитник (chooserId), для остальных окон — актор.
       const windowOwner = (pending as any).kind === 'await_choice' ? (pending as any).chooserId : (pending as any).actorId;
       if (byPlayerId && windowOwner && String(windowOwner) !== byPlayerId) {
-        return res.status(400).json({ message: 'Not your reaction window' });
+        return res.status(400).json({ message: 'Not your reaction window', code: 'BAD_REQUEST' });
       }
       if (pending.kind === 'play') {
         const actor = state.players.find((p) => p.id === pending.actorId)!;
         if (state.turn.currentPlayerId !== actor.id || state.turn.phase !== 'action') {
-          return res.status(400).json({ message: 'Not actor turn/phase' });
+          return res.status(400).json({ message: 'Not actor turn/phase', code: 'WRONG_PHASE' });
         }
         if ((pending as any).cancelLevel && (pending as any).cancelLevel > 0) {
-          moveRewoundPlayToDeck(state, pending as any);
+          resolveCancelledPlay(state, pending as any);
           entry.pending = null as any;
         } else {
           const result = await performPlayNow(entry as any, actor, req.params.id, (pending as any).cardId);
-          if (!result.ok) return res.status(400).json({ message: result.error });
+          if (!result.ok) return res.status(400).json({ message: result.error, code: 'BAD_REQUEST' });
           // Не затираем окно, открытое внутри эффекта (await_choice).
           if (entry.pending === pending) entry.pending = null;
         }
@@ -2055,7 +2284,7 @@ export async function resolvePendingNow(gameId: string, body: any = {}, io?: any
           entry.pending = null as any;
         } else {
           const actor = state.players.find(p => p.id === (pending as any).actorId)!;
-          const ctx: ResolveContext = { state, bus: entry.bus } as any;
+          const ctx: ResolveContext = { state, bus: entry.bus, logs: entry.logs } as any;
           const card = state.cards[(pending as any).sourceCardId] as any;
           const eff = ((card?.effects as any[]) || [])[Number((pending as any).effectIdx)] as any;
           if ((pending as any).intercept?.receiverPlayerId) {
@@ -2092,7 +2321,7 @@ export async function resolvePendingNow(gameId: string, body: any = {}, io?: any
           entry.pending = null as any;
         } else {
           const actor = state.players.find(p => p.id === (pending as any).actorId)!;
-          const ctx: ResolveContext = { state, bus: entry.bus } as any;
+          const ctx: ResolveContext = { state, bus: entry.bus, logs: entry.logs } as any;
           if ((pending as any).intercept?.receiverPlayerId) {
             (ctx as any).selectedPlayers = { [(pending as any).sourceCardId]: (pending as any).intercept.receiverPlayerId } as any;
           }
@@ -2130,11 +2359,24 @@ export async function resolvePendingNow(gameId: string, body: any = {}, io?: any
       } else if ((pending as any).kind === 'await_choice') {
         // Окно выбора защитника: отвечает chooser, карта обязана лежать в его руке и среди options.
         const chooser = state.players.find((p) => p.id === (pending as any).chooserId);
-        const chosenId = String(req.body?.cardId || '');
-        if (!chooser || !chosenId || !chooser.hand.includes(chosenId) || !((pending as any).options || []).includes(chosenId)) {
-          return res.status(400).json({ message: 'Card not in chooser hand' });
+        if ((pending as any).purpose === 'archangel_prevent') {
+          // Замена уничтожения (Архангел): отказ (decline) или выбор карты. Без ответа окно ждёт.
+          if (req.body?.decline === true) {
+            await resolveArchangelWindow(req.params.id, pending as any, null);
+          } else {
+            const chosenId = String(req.body?.cardId || '');
+            if (!chooser || !chosenId || !chooser.hand.includes(chosenId) || !((pending as any).options || []).includes(chosenId)) {
+              return res.status(400).json({ message: 'Card not in chooser hand', code: 'CARD_NOT_IN_HAND' });
+            }
+            await resolveArchangelWindow(req.params.id, pending as any, chosenId);
+          }
+        } else {
+          const chosenId = String(req.body?.cardId || '');
+          if (!chooser || !chosenId || !chooser.hand.includes(chosenId) || !((pending as any).options || []).includes(chosenId)) {
+            return res.status(400).json({ message: 'Card not in chooser hand', code: 'CARD_NOT_IN_HAND' });
+          }
+          finishAwaitChoice(req.params.id, pending as any, chosenId, true);
         }
-        finishAwaitChoice(req.params.id, pending as any, chosenId, true);
       }
       try {
         const io: any = (req.app as any).get('io');
