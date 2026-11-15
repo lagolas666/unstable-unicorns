@@ -1,4 +1,4 @@
-import { Action, Card, Effect, TargetSelector } from '../../../shared/src/types';
+import { Action, Card, Effect, TargetSelector, Trigger } from '../../../shared/src/types';
 import { EventBus, GameEvent } from './events';
 import { GameState, PlayerState, getZoneArray } from './state';
 // Единый расчёт победителя: раньше здесь была третья копия, расходившаяся с gameService
@@ -17,6 +17,7 @@ export function updateStableEffect(player: PlayerState, key: string, sourceCardI
 /** Регистрирует безусловные постоянные действия существующих источников. */
 export function updateStableEffects(state: GameState): void {
   for (const owner of state.players) {
+    owner.stableEffects = (owner.stableEffects || []).filter(entry => owner.stable.includes(entry.sourceCardId));
     for (const sourceCardId of owner.stable) {
       const effects = (state.cards[sourceCardId] as any)?.effects;
       if (!Array.isArray(effects)) continue;
@@ -24,7 +25,7 @@ export function updateStableEffects(state: GameState): void {
         if (effect.trigger !== 'while_in_stable' || effect.condition || effect.optional || (effect.while_source_in && effect.while_source_in !== 'stable')) return;
         if (!Array.isArray(effect.actions)) return;
         effect.actions.forEach((action: any, actionIndex: number) => {
-          if (!['reactive_trigger', 'modify_hand_limit', 'restrict_action', 'modify_action'].includes(action.kind)) return;
+          if (!['prevent', 'reactive_trigger', 'modify_hand_limit', 'restrict_action', 'modify_action'].includes(action.kind)) return;
           updateStableEffect(owner, `${sourceCardId}:${effectIndex}:${actionIndex}`, sourceCardId, action);
         });
       });
@@ -66,12 +67,18 @@ export interface ResolveContext {
    * Если задан, резолвер может не выполнять эффект немедленно, а создать pending-окно.
    */
   requestReactionWindow?: (params: {
-    trigger: 'when_destroyed' | 'when_enters';
+    // V7-4: окна реакций также для on_opponent_* (список = CATALOG_TRIGGERS, data-driven)
+    trigger: 'when_destroyed' | 'when_enters'
+      | 'on_opponent_play' | 'on_opponent_plays_neigh' | 'on_opponent_plays_spell' | 'on_opponent_plays_unicorn'
+      | 'on_opponent_plays_upgrade_downgrade' | 'on_opponent_pull_baby' | 'on_opponent_sacrifices'
+      | 'on_opponent_unicorn_effect' | 'on_opponent_would_draw';
     actorId: string;
     sourceCardId: string;
     effectIdx: number;
     uncounterable?: boolean;
     allow_intercept?: boolean;
+    /** V7-4: optional-реакция исполняется только при явном confirm владельца. */
+    optional?: boolean;
   }) => void;
   /**
    * Пометка для полного предотвращения выполнения эффекта по sourceCardId.
@@ -421,6 +428,22 @@ function matchesFilter(card: Card | undefined, filter: any, sourceId?: string): 
   return true;
 }
 
+// Проверяет постоянные запреты розыгрыша по актуальным источникам и фильтрам карты.
+export function isPlayPrevented(state: GameState, player: PlayerState, card: Card | undefined): boolean {
+  if (!card) return false;
+  return state.players.some(owner => (owner.stableEffects || []).some(({ sourceCardId, action }) => {
+    if (!owner.stable.includes(sourceCardId)) return false;
+    const target = action.target_player ?? action.target?.scope ?? 'self';
+    const applies = target === 'any' || target === 'all' || target === 'all_players'
+      || target === 'self' && owner.id === player.id
+      || (target === 'opponent' || target === 'opponents' || target === 'others') && owner.id !== player.id;
+    if (!applies) return false;
+    if (action.kind === 'restrict_action') return action.action_type === 'play_spell' && card.type === 'magic';
+    if (action.kind !== 'prevent' || action.prevented_action !== 'play') return false;
+    return matchesFilter(card, action.target?.filters, sourceCardId);
+  }));
+}
+
 // Basic immunity flags support
 function hasTag(card: Card | undefined, tag: string): boolean {
   if (!card) return false;
@@ -441,6 +464,12 @@ function hasImmunity(card: Card | undefined, kind: string): boolean {
 
 function isTargetableFor(actionKind: string, card: Card | undefined, actorId: string, ownerId: string, state?: GameState): boolean {
   if (!card) return false;
+  if (actionKind === 'destroy' && state) {
+    const owner = state.players.find(p => p.id === ownerId);
+    if (card.id && owner?.stable.includes(card.id) && (owner.stableEffects || []).some(({ sourceCardId, action }) =>
+      owner.stable.includes(sourceCardId) && action.kind === 'prevent' && action.prevented_action === 'destroy'
+      && matchesFilter(card, action.target?.filters, sourceCardId))) return false;
+  }
   // Аура маски: пока штраф-маска лежит в конюшне владельца, его единорога нельзя выбрать целью
   // для sacrifice/steal/destroy/move/swap. Собственные эффекты самой карты при этом не отключаются.
   if (state && isActionBlockedByMask(actionKind) && isMaskedUnicorn(state, card, ownerId)) return false;
@@ -517,6 +546,32 @@ export async function triggerEnterEffectsFor(ctx: ResolveContext, owner: PlayerS
   const card = ctx.state.cards[cardId];
   if (!card) return;
   const effects = (Array.isArray((card as any).effects) ? (card as any).effects : []) as Effect[];
+  // Реакции исполняются по данным действующих источников после помещения карты в стойло.
+  for (const sourceOwner of ctx.state.players) {
+    for (const entry of [...(sourceOwner.stableEffects || [])]) {
+      const action = entry.action as any;
+      if (!sourceOwner.stable.includes(entry.sourceCardId) || action.kind !== 'reactive_trigger') continue;
+      const events = Array.isArray(action.on_event) ? action.on_event : [action.on_event];
+      if (!events.includes('on_enter_stable')) continue;
+      const condition = action.condition || {};
+      if (condition.target_zone === 'self_stable' && owner.id !== sourceOwner.id) continue;
+      if (condition.target_card_type && !matchesCardGroup(card, condition.target_card_type)) continue;
+      if (Array.isArray(condition.rules) && !condition.rules.every((rule: any) => {
+        if (rule.type !== 'count_in_zone' || rule.target !== 'self_stable' || owner.id !== sourceOwner.id) return false;
+        const count = sourceOwner.stable.filter(id => matchesCardGroup(ctx.state.cards[id], rule.card_group)).length;
+        return rule.comparison === '>' && count > Number(rule.value);
+      })) continue;
+      if (condition.operator && condition.operator !== 'AND') continue;
+      if (!Array.isArray(action.actions)) continue;
+      const previousSource = ctx.currentSourceId;
+      ctx.currentSourceId = entry.sourceCardId;
+      await resolveActions(ctx, sourceOwner, action.actions);
+      ctx.currentSourceId = previousSource;
+    }
+  }
+  if ((owner.stableEffects || []).some(({ sourceCardId, action }) => owner.stable.includes(sourceCardId)
+    && action.kind === 'prevent' && action.prevented_action === 'on_enter_stable'
+    && matchesFilter(card, action.target?.filters, sourceCardId))) return;
   // Вход в стойло: единственный источник истины — данные карты (effects.on_enter_stable), драйвер ниже.
   // Фолбэк-блоки по имени (Nightmare / Archangel) снесены 05.11.2026: у Малышей (baby_nightmare_unicorn,
   // baby_archangel_unicorn) effects: [] и пустой текст карты, а подстрока "nightmare"/"archangel" ложно
@@ -557,6 +612,91 @@ export async function triggerEnterEffectsFor(ctx: ResolveContext, owner: PlayerS
       }
     }
   }
+}
+
+// ==================== V7-4: диспетчер реактивных триггеров on_opponent_* ====================
+// Реактивные эффекты живут в стабильах (единороги/upgrade/downgrade) и описаны ТОЛЬКО данными:
+// effects[].trigger === 'on_opponent_*' + actions[]. Диспетчер сканирует стабильы всех игроков,
+// находит эффекты с совпадающим trigger (владелец ≠ источник события) и:
+//  - опасные (destroy/steal/sacrifice/force_discard), stack-scope или uncounterable — открывает окно
+//    реакции (pending kind='trigger_effect' через ctx.requestReactionWindow);
+//  - безопасные необязательные — исполняет немедленно через resolveEffect;
+//  - optional — окно с pending.optional=true: автоисполнения нет, нужен confirm владельца.
+// Никаких сравнений по имени карты — только trigger/kind/actions из JSON.
+export type TriggerPrompt = {
+  ownerId: string;
+  sourceCardId: string;
+  effectIdx: number;
+  trigger: Trigger;
+  optional: boolean;
+  uncounterable: boolean;
+};
+
+/** Нужен ли эффекту противодействия: опасные действия, scope stack или uncounterable. */
+function effectNeedsReactionWindow(eff: any): boolean {
+  const actions: any[] = Array.isArray(eff?.actions) ? eff.actions : [];
+  const hasDanger = actions.some((a) => ['destroy', 'steal', 'sacrifice', 'force_discard'].includes(String(a?.kind)));
+  const hasStackScope = actions.some((a) => String(a?.target?.scope ?? a?.targets?.scope ?? '') === 'stack');
+  return hasDanger || hasStackScope || !!eff?.uncounterable;
+}
+
+/**
+ * V7-4: вызвать все реактивные эффекты заданного события (например 'on_opponent_play')
+ * у всех игроков, кроме источника события. Событие приходит из flow (тип разыгранной карты,
+ * добор, etc.), поведение эффекта — целиком из данных карты. Возвращает затронутые эффекты.
+ */
+export async function dispatchTrigger(ctx: ResolveContext, actorId: string, event: Trigger, _eventCardId?: string): Promise<TriggerPrompt[]> {
+  const prompts: TriggerPrompt[] = [];
+  for (const owner of ctx.state.players) {
+    if (owner.id === actorId) continue; // on_opponent_*: реагирует только чужой стабиль
+    for (const cid of [...owner.stable]) {
+      const card = ctx.state.cards[cid] as any;
+      if (!card || !Array.isArray(card.effects)) continue;
+      const effects = card.effects as any[];
+      for (let i = 0; i < effects.length; i++) {
+        const eff = effects[i];
+        if (!eff || eff.trigger !== event) continue;
+        const cond = (eff as any).condition;
+        if (cond && !evaluateCondition(ctx, owner, cond)) continue;
+        const whileZone = (eff as any).while_source_in;
+        if (whileZone) {
+          let found = false;
+          for (const p of ctx.state.players) {
+            if (getZoneArrayWithShared(ctx, p, whileZone).includes(cid)) { found = true; break; }
+          }
+          if (!found) continue;
+        }
+        const prompt: TriggerPrompt = {
+          ownerId: owner.id,
+          sourceCardId: cid,
+          effectIdx: i,
+          trigger: event,
+          optional: !!(eff as any).optional,
+          uncounterable: !!(eff as any).uncounterable,
+        };
+        prompts.push(prompt);
+        const effActions: any[] = Array.isArray((eff as any).actions) ? (eff as any).actions : [];
+        const allowIntercept = effActions.some((a: any) => a && a.kind === 'steal');
+        // Дефект-1 (отчёт Аналитика 13.11.2026): окно реакции открывается для ЛЮБОГО optional-эффекта,
+        // а не только для опасных действий. Иначе confirm владельца недостижим (pendingUpdateKind undefined).
+        if (ctx.requestReactionWindow && (effectNeedsReactionWindow(eff) || !!eff.optional)) {
+          ctx.requestReactionWindow({
+            trigger: event as any,
+            actorId: owner.id,
+            sourceCardId: cid,
+            effectIdx: i,
+            uncounterable: prompt.uncounterable,
+            allow_intercept: allowIntercept,
+            optional: prompt.optional,
+          });
+        } else if (!prompt.optional) {
+          await resolveEffect(ctx, owner, cid, eff as Effect);
+        }
+        // optional без окна: остаётся в prompts для UI/тестов, автоисполнения нет
+      }
+    }
+  }
+  return prompts;
 }
 
 // Helper: when a card is destroyed (moved from stable to discard), execute its when_destroyed effects for the previous owner
@@ -632,6 +772,9 @@ function isActionPossible(ctx: ResolveContext, player: PlayerState, action: Acti
   // до switch по строке (case по ним даёт TS2678) — тем же приёмом, что 'draw' в executeAction.
   const extraKind = String((action as any)?.kind);
   normalizeActionTargets(action as any); // Б1: destroy/sacrifice/discard читают .targets, каталог даёт .target
+  if (extraKind === 'pull' && (action as any)?.targets?.zone === 'nursery') {
+    return Array.isArray(ctx.state.nursery) && ctx.state.nursery.some(id => matchesFilter(ctx.state.cards[id], (action as any).targets.filters));
+  }
   if (extraKind === 'pull' || extraKind === 'force_discard') {
     // Нужен хотя бы один соперник, у которого есть что забрать или сбросить.
     return ctx.state.players.some(p => p.id !== player.id && p.hand.length > 0);
@@ -947,6 +1090,13 @@ function swapQuantity(action: any, a?: TargetSelector, b?: TargetSelector): numb
 }
 
 export async function resolveEffect(ctx: ResolveContext, player: PlayerState, sourceCardId: string, effect: Effect): Promise<ResolutionResult> {
+  // Подавляем только эффекты входящей карты, а не постоянные эффекты источника.
+  const sourceCard = ctx.state.cards[sourceCardId];
+  if (['immediate', 'on_play', 'on_enter_stable'].includes(String((effect as any).trigger))
+    && player.stable.includes(sourceCardId)
+    && (player.stableEffects || []).some(({ sourceCardId: preventId, action }) =>
+      player.stable.includes(preventId) && action.kind === 'prevent' && action.prevented_action === 'on_enter_stable'
+      && matchesFilter(sourceCard, action.target?.filters, preventId))) return { success: true };
   // Respect minimal metadata on Effect: while_source_in (skip if source not in zone)
   const effAny = effect as any;
   if (effAny.while_source_in) {
@@ -964,6 +1114,7 @@ export async function resolveEffect(ctx: ResolveContext, player: PlayerState, so
   }
   // For now: evaluate actions in order, honoring requires_success_of_previous and skipping impossible actions
   let prevSucceeded = true;
+  let anySucceeded = false;
   (ctx as any).currentSourceId = sourceCardId;
   // В6-2a/scope: собрать неразобранные селекторы до исполнения, чтобы список попал в отчёт
   reportScopeUnresolved(ctx, player, sourceCardId, effect.actions as any[]);
@@ -986,7 +1137,12 @@ export async function resolveEffect(ctx: ResolveContext, player: PlayerState, so
     }
     const ok = await executeAction(ctx, player, action);
     ctx.bus.emit({ type: 'action_resolved', action, success: ok });
+    if (ok) anySucceeded = true;
     prevSucceeded = ok;
+  }
+  // Событие отправляется только после успешного действия эффекта единорога.
+  if (anySucceeded && isUnicornCard(sourceCard?.type) && !String(effect.trigger).startsWith('on_opponent_')) {
+    await dispatchTrigger(ctx, player.id, 'on_opponent_unicorn_effect', sourceCardId);
   }
   // В6-3a-2: единая точка публикации следа пропущенных optional — сюда попадают все kind,
   // включая те, что ещё не пишут пропуски (flush пустого набора ничего не делает).
@@ -1228,12 +1384,22 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
   // Sentinel Unicorn), но отсутствует в union ActionKind в shared/src/types.ts, поэтому
   // обрабатываем до switch по приведению типа — общий контракт не расширяем без согласования.
   const extraKind = String((action as any)?.kind);
-  if (['reactive_trigger', 'modify_hand_limit', 'restrict_action', 'modify_action'].includes(extraKind)) {
+  if (['prevent', 'reactive_trigger', 'modify_hand_limit', 'restrict_action', 'modify_action'].includes(extraKind)) {
     if (!ctx.currentSourceId || !ctx.currentStableEffectKey) return false;
     updateStableEffect(player, ctx.currentStableEffectKey, ctx.currentSourceId, action as any);
     return true;
   }
   normalizeActionTargets(action as any); // Б1: те же .target/.targets, вход в executeAction
+  if (extraKind === 'pull' && (action as any)?.targets?.zone === 'nursery') {
+    const nursery = ctx.state.nursery || [];
+    const index = nursery.findIndex(id => matchesFilter(ctx.state.cards[id], (action as any).targets.filters));
+    if (index < 0) return false;
+    const [cardId] = nursery.splice(index, 1);
+    player.stable.push(cardId);
+    await triggerEnterEffectsFor(ctx, player, cardId);
+    await dispatchTrigger(ctx, player.id, 'on_opponent_pull_baby', cardId);
+    return true;
+  }
   if (extraKind === 'pull') return executePull(ctx, player);
   if (extraKind === 'force_discard' || extraKind === 'return_to_hand') {
     const q = Number((action as any)?.targets?.quantity?.value ?? 1);
@@ -1367,7 +1533,19 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
     case 'sacrifice': {
       // move selected cards from player's stable (or specified zone) to discard
       const sel = (action as any).targets as TargetSelector;
-      const qty = (sel as any).quantity?.value ?? 1;
+      let qty = (sel as any).quantity?.value ?? 1;
+      for (const owner of ctx.state.players) {
+        for (const entry of owner.stableEffects || []) {
+          const modifier = entry.action as any;
+          const target = modifier.target_player ?? 'self';
+          if (!owner.stable.includes(entry.sourceCardId) || modifier.kind !== 'modify_action'
+            || modifier.action_type !== 'sacrifice') continue;
+          if (!['all', 'any', 'all_players'].includes(target) && !(target === 'self' && owner.id === player.id)
+            && !(['opponent', 'opponents', 'others'].includes(target) && owner.id !== player.id)) continue;
+          const value = Number(modifier.modifier?.quantity);
+          if (Number.isFinite(value) && value > 0) qty = value;
+        }
+      }
       const zone = (sel as any).zone as any;
       const group = (sel as any)?.filters?.card_group;
       const chosen = ((ctx as any).currentSourceId && (ctx as any).selectedTargets && (ctx as any).selectedTargets[(ctx as any).currentSourceId]) || [];
@@ -1422,6 +1600,7 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
         // Вернуть пропущенные в конец массива (верх стойла) в исходном порядке
         for (const sid of skipped) srcArr.push(sid);
       }
+      for (const ownerId of movedBy.keys()) await dispatchTrigger(ctx, ownerId, 'on_opponent_sacrifices');
       return moved > 0;
     }
     case 'move': {
@@ -1994,6 +2173,7 @@ async function executeAction(ctx: ResolveContext, player: PlayerState, action: A
         maybeInterceptMagicToHand(ctx, player, id);
         moved++;
       }
+      if (moved > 0) await dispatchTrigger(ctx, player.id, 'on_opponent_sacrifices');
       return moved >= qty;
     }
     case 'destroy': {

@@ -105,13 +105,67 @@
 ```typescript
 // Request
 {
-  cardId?: string;       // выбранная карта
-  skip?: boolean;        // true = закрыть окно без выбора
-  byPlayerId?: string;   // кто отвечает
+  cardId?: string;       // выбранная карта (для await_choice, archangel_prevent)
+  skip?: boolean;        // отдельно не обрабатывается; для optional trigger_effect отказ задаётся отсутствием confirm:true
+  byPlayerId?: string;   // кто отвечает (валидируется против владельца окна)
+  confirm?: boolean;     // true = исполнить optional-эффект (для trigger_effect с optional:true)
+  decline?: boolean;     // true = отказ от замены уничтожения (для archangel_prevent)
 }
 
-// Response 200 — голый GameState или { pending, state }
+// Поведение по видам pending:
+//
+// kind === 'play':
+//   Исполняет розыгрыш карты (performPlayNow) или завершает отмену (cancelLevel > 0).
+//   Валидация: byPlayerId (если указан) обязан совпадать с actorId владельца окна.
+//
+// kind === 'turn_start_effect':
+//   Исполняет отложенный эффект начала хода (on_turn_start).
+//
+// kind === 'trigger_effect' с optional === true:
+//   confirm:true от владельца окна исполняет эффект, если окно не отменено.
+//   Если confirm:true без byPlayerId или с чужим byPlayerId — HTTP 400.
+//   * Если окно не отменено: запрос без confirm:true (включая skip:true, confirm:false или пустое тело)
+//     закрывает его без исполнения и пишет optional_declined. Поле skip отдельно не проверяется.
+//   * Если окно уже отменено (cancelLevel > 0), отмена обрабатывается раньше optional-ветки.
+//   * Таймаут также отклоняет optional-эффект без исполнения.
+//
+// kind === 'trigger_effect' без optional:
+//   Исполняет эффект при resolvePending, если окно не отменено (cancelLevel отсутствует или равен 0);
+//   при cancelLevel > 0 фиксируется отмена и эффект не исполняется.
+//
+// kind === 'await_choice':
+//   * cardId — выбранная карта из руки защитника.
+//   * Валидация: карта должна быть в hand и среди pending.options.
+//   * skip не обрабатывается: для обычного выбора без cardId будет HTTP 400.
+//   * Для purpose === 'archangel_prevent':
+//     - decline:true — отказ, уничтожение проходит штатно.
+//     - cardId — сброс этой карты вместо уничтоженной.
+//   * Для purpose === 'hand_limit':
+//     - cardId обязателен; после сброса окно переоткрывается, если рука всё ещё выше лимита.
+//
+// Владелец окна:
+//   Для await_choice это chooserId, для остальных pending — actorId.
+//   Если byPlayerId передан и владелец окна определён, значение должно совпадать; иначе HTTP 400.
+//   Для optional trigger_effect с confirm:true byPlayerId обязателен и должен совпадать с actorId.
+//   В socket-событии resolve_pending byPlayerId подставляется сервером из участника соединения.
+
+// Response 200:
+// Если окно заменено новым (напр., await_choice внутри trigger_effect):
+{ pending: PendingAction, state: GameState }
+// Иначе:
+<голый GameState>
+
+// Response 4xx (отказ):
+{
+  message: string;          // например: 'Nothing pending', 'Not your reaction window',
+                            //          'Card not in chooser hand', 'Not actor turn/phase'
+  code?: string;            // опциональный машинный код: 'nothing_pending', 'CARD_NOT_IN_HAND'
+}
 ```
+
+**HTTP-статусы отказа:**
+- `400` — нет pending, не ваш ход/фаза, не ваше окно реакции, карта не в руке
+- `404` — игра не найдена
 
 ---
 

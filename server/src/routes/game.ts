@@ -2,8 +2,8 @@ import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { EventBus } from '../engine/events';
 import { GameState, PlayerState } from '../engine/state';
-import { resolveEffect, ResolveContext, resolveActions, triggerTurnStartEffects, TurnStartPrompt } from '../engine/executor';
-import { Card, Effect } from '../../../shared/src/types';
+import { resolveEffect, ResolveContext, resolveActions, triggerTurnStartEffects, TurnStartPrompt, dispatchTrigger } from '../engine/executor';
+import { Card, Effect, Trigger } from '../../../shared/src/types';
 import CardModel from '../models/Card';
 import { applyCanReactFlagsToDict } from '../data/canReactFlags';
 import { loadCatalogFixture } from '../data/catalog';
@@ -26,11 +26,8 @@ function findNeighBlockOwner(state: GameState): string | null {
     for (const cid of p.stable) {
       const c = (state.cards as any)[cid] as any;
       if (!c) continue;
-      // General flag support
-      if (c.block_neigh_for_others === true) return p.id;
-      // Back-compat: Elusive Oceloticorn by name
-      const name = String((c?.name || c?.Название || '')).toLowerCase();
-      if (name === 'elusive oceloticorn' || name.includes('oceloticorn')) return p.id;
+      // Общий флаг карты, без зависимости от её названия.
+      if (c.blocks_neigh_for_others === true || c.static_properties?.blocks_neigh_for_others === true) return p.id;
     }
   }
   return null;
@@ -888,6 +885,18 @@ router.post('/:id/playWithTargets', async (req: Request, res: Response) => {
     state.discard!.push(cardId);
   }
 
+  // V7-4: этот маршрут разрешает безопасные playWithTargets напрямую, не проходя через
+  // playCard/performPlayNow. После фактического розыгрыша диспатчим те же события по типу карты;
+  // эффекты и перемещение карты повторно не выполняются. Опасные карты уже вышли выше в pending.
+  if (!hypnoCanceledPwT) {
+    const events: Trigger[] = ['on_opponent_play'];
+    if (isUnicornCard(card.type)) events.push('on_opponent_plays_unicorn');
+    if (ctype === 'upgrade' || ctype === 'downgrade') events.push('on_opponent_plays_upgrade_downgrade');
+    if (ctype === 'magic') events.push('on_opponent_plays_spell');
+    if (ctype === 'instant' && String((card as any)?.instant_subtype || '') === 'neigh') events.push('on_opponent_plays_neigh');
+    for (const event of events) await dispatchTrigger(ctx, player.id, event, cardId);
+  }
+
   // Spend AP and log
   player.action_points = Math.max(0, (player.action_points || 0) - 1);
   entry.logs.push({ t: Date.now(), type: 'play', playerId: player.id, details: { cardId, name: (state.cards as any)[cardId]?.name, via: 'playWithTargets', targets } });
@@ -897,9 +906,15 @@ router.post('/:id/playWithTargets', async (req: Request, res: Response) => {
   if (winner && !(state as any).winnerId) (state as any).winnerId = winner;
   try {
     const io: any = (req.app as any).get('io');
-    io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
-    io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+    if (entry.pending) {
+      io?.to?.(`game:${req.params.id}`)?.emit?.('pending_update', entry.pending);
+      io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+    } else {
+      io?.to?.(`game:${req.params.id}`)?.emit?.('state_update', state);
+      io?.to?.(`game:${req.params.id}`)?.emit?.('logs_update', entry.logs.slice(-100));
+    }
   } catch {}
+  if (entry.pending) return res.json({ pending: entry.pending, state });
   res.json(state);
 });
 
@@ -1051,10 +1066,10 @@ router.post('/:id/playWithWindow', (req, res) => {
   const cdef = state.cards[cardId] as any;
   const ceffects = (cdef?.effects as any[]) || [];
   const dangerousEff = ceffects.find((ef) => (ef.trigger === 'on_play' || ef.trigger === 'immediate') && Array.isArray(ef.actions) && ef.actions.some((a: any) => ['destroy','steal','sacrifice'].includes(String(a.kind))));
-  // Карта может сама быть не «нейхабельной» при розыгрыше
-  const nameLower = String((cdef?.name || cdef?.Название || '')).toLowerCase();
-  const isElusiveOceloticorn = nameLower === 'elusive oceloticorn' || nameLower.includes('oceloticorn');
-  const uncounterable = !!(dangerousEff && (dangerousEff as any).uncounterable) || isElusiveOceloticorn || (cdef as any).cannot_be_neighed === true;
+  // Неотменяемость определяется свойствами карты или её эффекта, а не названием.
+  const uncounterable = !!(dangerousEff && (dangerousEff as any).uncounterable)
+    || (cdef as any).cannot_be_neighed === true
+    || (cdef as any).static_properties?.cannot_be_neighed === true;
   entry.pending = { kind: 'play', actorId: actor.id, cardId, cancelLevel: 0, expiresAt: Date.now() + 5000, uncounterable } as any;
   entry.logs.push({ t: Date.now(), type: 'play', playerId: actor.id, details: { pending: 'play', cardId } });
   try {

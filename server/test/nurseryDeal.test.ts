@@ -15,34 +15,41 @@ import app from '../src/testApp';
  * find(type === 'baby_unicorn') и клала его в стойла ВСЕХ игроков — один экземпляр висел
  * в нескольких стойлах, а Nursery терял 1 карту вместо N. N2 и N6 стерегут именно это.
  *
- * Числа каталога НЕ хардкодятся вслепую: total/flagged/nonFlagged читаются из
- * server/data/catalog.v2.json, а страж CATALOG_TOTAL/CATALOG_FLAGGED ниже ловит момент,
- * когда каталог поменялся и файл протух молча — именно так он и протух в прошлый раз.
+ * Все ожидания Nursery и общей колоды считаются по фактически включённым копиям:
+ * active:false исключает запись, deck_count задаёт число копий (по умолчанию 1).
  *
  * Разрешено трогать только server/test/**. Если проверка краснеет — это находка в src/**,
  * о ней сообщается как BLOCKED, а не правится здесь.
  */
 
 const CATALOG_PATH = path.resolve(__dirname, '../data/catalog.v2.json');
-const CATALOG_TOTAL = 329; // страж: столько карт в каталоге на момент написания
-const CATALOG_FLAGGED = 53; // страж: столько Малышей с флагом source_zone
+const CATALOG_TOTAL = 329; // страж: столько записей каталога на момент написания
+const CATALOG_ACTIVE_TOTAL = 328; // включённые экземпляры с учётом active/deck_count
+const CATALOG_FLAGGED = 53; // включённые копии Малышей с флагом source_zone
 const NURSERY_FLAG = 'nursery_only';
 const STARTING_HAND = 5;
 
 type AnyState = any;
 
-function loadCatalog(): { total: number; flagged: number; nonFlagged: number } {
+function loadCatalog(): { total: number; activeTotal: number; flagged: number; nonFlagged: number } {
   const raw = JSON.parse(fs.readFileSync(CATALOG_PATH, 'utf8'));
   const cards = Array.isArray(raw) ? raw : raw.cards || raw.all || [];
-  const flagged = cards.filter(
-    (c: any) => String(c?.source_zone || '') === NURSERY_FLAG,
-  ).length;
-  return { total: cards.length, flagged, nonFlagged: cards.length - flagged };
+  const activeCopies = (card: any): number => {
+    if (card?.active === false) return 0;
+    const count = Number(card?.deck_count);
+    return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 1;
+  };
+  const activeTotal = cards.reduce((sum: number, card: any) => sum + activeCopies(card), 0);
+  const flagged = cards.reduce(
+    (sum: number, card: any) => sum + (String(card?.source_zone || '') === NURSERY_FLAG ? activeCopies(card) : 0),
+    0,
+  );
+  return { total: cards.length, activeTotal, flagged, nonFlagged: activeTotal - flagged };
 }
 
 const CATALOG = loadCatalog();
-const FLAGGED_COPIES = CATALOG.flagged; // 53
-const NON_FLAGGED_COPIES = CATALOG.nonFlagged; // 276
+const FLAGGED_COPIES = CATALOG.flagged;
+const NON_FLAGGED_COPIES = CATALOG.nonFlagged;
 
 async function createGame(players: string[]): Promise<AnyState> {
   const res = await request(app)
@@ -91,14 +98,15 @@ function handTotal(state: AnyState): number {
 }
 
 describe('Каталог — источник чисел для этого файла', () => {
-  it('C0: каталог не поменялся под ногами (329 карт, 53 Малыша с флагом)', () => {
+  it('C0: каталог не поменялся под ногами (329 записей, 328 активных копий, 53 Малыша)', () => {
     // Если этот ассерт покраснел — изменился КАТАЛОГ, а не движок.
     // Тогда числа ниже надо пересчитать, а не искать регрессию в src/**.
     expect({
       total: CATALOG.total,
+      activeTotal: CATALOG.activeTotal,
       flagged: CATALOG.flagged,
-    }).toEqual({ total: CATALOG_TOTAL, flagged: CATALOG_FLAGGED });
-    expect(CATALOG.nonFlagged).toBe(CATALOG.total - CATALOG.flagged);
+    }).toEqual({ total: CATALOG_TOTAL, activeTotal: CATALOG_ACTIVE_TOTAL, flagged: CATALOG_FLAGGED });
+    expect(CATALOG.nonFlagged + CATALOG.flagged).toBe(CATALOG.activeTotal);
   });
 });
 

@@ -25,7 +25,6 @@ export const CAN_REACT_FLAGS: Record<string, CanReactFlags> = {
   'super neigh': { cannot_be_neighed: true },
   'super neigh (c&c)': { cannot_be_neighed: true },
   'neigh means neigh': { cannot_be_neighed: true },
-  'elusive oceloticorn': { cannot_be_neighed: true, blocks_neigh_for_others: true },
   'yay': { blocks_neigh_against_owner: true },
 };
 
@@ -39,6 +38,9 @@ export function applyCanReactFlags<T extends Record<string, any>>(card: T): T {
   // Смотрим оба поля, иначе флаги cannot_be_neighed / blocks_neigh_for_others теряются молча.
   let flags = canReactFlagsForCardName(card.name);
   if (!hasAnyFlag(flags)) flags = canReactFlagsForCardName((card as any).name_en);
+  for (const key of ['cannot_be_neighed', 'blocks_neigh_for_others', 'blocks_instants_against_owner', 'blocks_neigh_against_owner'] as Array<keyof CanReactFlags>) {
+    if (card.static_properties?.[key] === true) (card as any)[key] = true;
+  }
   for (const key of Object.keys(flags) as Array<keyof CanReactFlags>) {
     if (flags[key] === true) (card as any)[key] = true;
   }

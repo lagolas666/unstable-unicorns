@@ -2876,10 +2876,10 @@
   "id": "intervention",
   "name": "Intervention",
   "type": "instant",
+  "active": false,
+  "deck_count": 0,
   "description": "C&C Prвt Secнаd Editiна: Ply this crd when nor plyer tries в SACRIFICE crd. DESTROY crd в thв plyer's Stble вместо. C&C Prвt: Ply this crd when ny or plyer tries в SACRIFICE crd. Sвp thв пожертвуй effect и choose ny plyer. SACRIFICE or DESTROY crd в thв plyer's Stble.",
   "image": "/uploads/wiki/5e07590d91ad5f65b47a0252aeb88d33.png",
-  "active": true,
-  "deck_count": 1,
   "effects": []
  },
  {

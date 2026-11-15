@@ -2,6 +2,7 @@
 
 Стадия 1 плана `docs/plan-effect-vocabulary.md`.
 Дата замера: 12.11.2026. Исполнитель: Аналитик.
+Последнее обновление (V7-2): 12.11.2026. Аналитик.
 
 ## Метод
 
@@ -29,17 +30,19 @@
   `resolveEffect` помечает `prevSucceeded = false`, и эффект молча скипается.
 - Исключение: `set_flag`, `modify_win_condition` имеют case → работают корректно.
 
-### Статус карт с while_in_stable:
+### Статус карт с while_in_stable (V7-3):
 
 | Карта | kind(ы) в действии | Работает? |
 |---|---|---|
 | Видеоняня, Пандамониум, Котострофа, Выдропокалипсис | `set_flag` | ✅ да (case есть) |
 | Воображаемый другорог | `modify_win_condition` | ✅ да (case есть) |
-| Единорог-Пчелиная королева, Радужная аура, Ослепляющий свет, Ленивцерог | `prevent` | ❌ default → false |
-| Колючая проволка, Крошечная конюшня, Триумфальный единорог, Стакан наполовину полон, Антимагический пузырь (effect[1]), Выпас запрещен, Налог на единорогов, Единорог 90 уровня, Единорог-кукловод, Теневой единорог | `reactive_trigger` | ❌ default → false |
-| Единорог голода | `modify_hand_limit` | ❌ default → false |
-| Антимагический пузырь (effect[0]) | `restrict_action` | ❌ default → false |
-| Единорог-нулевой пациент, Параллельный вселеннорог, Страшный единорог-пират | `modify_action` | ❌ default → false |
+| Единорог-Пчелиная королева (prevented_action=play) | `prevent` | ✅ `isPlayPrevented` проверяет `'play'` |
+| Радужная аура (prevented_action=destroy) | `prevent` | ✅ `isTargetableFor` проверяет `destroy` с V7-3 |
+| Ослепляющий свет, Ленивцерог (prevented_action=on_enter_stable) | `prevent` | ✅ `triggerEnterEffectsFor` + `resolveEffect` подавляют с V7-3 |
+| Колючая проволка, Крошечная конюшня, Триумфальный единорог, Стакан наполовину полон, Антимагический пузырь (effect[1]), Выпас запрещен, Налог на единорогов, Единорог 90 уровня, Единорог-кукловод, Теневой единорог | `reactive_trigger` | ✅ `triggerEnterEffectsFor` исполняет `on_enter_stable` с V7-3 (`barbed_wire`, `tiny_stable` — зелёные). Остальные события не реализованы. |
+| Единорог голода | `modify_hand_limit` | ⚠️ `handLimitFor` (отдельный путь) — не через `isPlayPrevented`
+| Антимагический пузырь (effect[0]) | `restrict_action` | ✅ `isPlayPrevented` обрабатывает `restrict_action` с `play_spell` + `magic` |
+| Единорог-нулевой пациент, Параллельный вселеннорог, Страшный единорог-пират | `modify_action` | ✅ `executeAction` → `case 'sacrifice'` читает modify_action с V7-3 (patient_zero — зелёный). Только sacrifice quantity. |
 | Похищение единорогов | `sacrifice` (condition с count_in_zone) | ⚠️ sacrifice жив, но condition-движок не тестировался |
 
 ---
@@ -56,11 +59,11 @@
 | move | 18 | `case 'move'` L680, L1157 | — | — | **живой** |
 | shuffle_deck | 17 | `case 'shuffle_deck'` L1797 | — | — | **живой** |
 | steal | 17 | `case 'steal'` L681, L1407 | — | — | **живой** |
-| reactive_trigger | 10 | — | — | — | **НИКТО** (0 вхождений строки во всём `server/src`) |
+| reactive_trigger | 10 | `updateStableEffect` L29 регистрирует; `triggerEnterEffectsFor` L546 исполняет `on_enter_stable` | — | **живой (только on_enter_stable)** |
 | return | 9 | `case 'return'` L684, L1238 | — | — | **живой** |
 | cancel | 9 | — | L2054, L2091 — только `details.kind = 'cancel'` в логе реакции, не диспетчер | — | **НИКТО** (реакционный слой отменяет по `cancelLevel`, не по kind карты) |
 | force_discard | 8 | `extraKind === 'force_discard'` L658, L955→`executeForceDiscard` | — | — | **живой, вне `ActionKind`** |
-| prevent | 8 | — | L1388 — `details.kind = 'prevent'` в логе `reactPrevent`, не диспетчер; `routes/cards.ts:193` — валидатор | — | **НИКТО** (функц. эквивалент только реакционным окном, не данными карты) |
+| prevent | 8 | `isPlayPrevented` L422 — диспетчер для `prevented_action === 'play'`; `isTargetableFor` L461 — для `destroy`; `triggerEnterEffectsFor` L585 — для `on_enter_stable`; `resolveEffect` L999 — подавление входящих эффектов | — | — | **живой** (play + destroy + on_enter_stable) |
 | skip_phase | 6 | `case 'skip_phase'` L1557 | — | — | **живой** |
 | choice | 6 | L856 явно: «choice требует UI await_choice» → не реализован | `pending.kind === 'await_choice'` L60, L2025, L2130 — это вид pending, а не `ActionKind` | — | **НИКТО как kind** (есть суррогат: pending `await_choice`) |
 | pull | 6 | `extraKind === 'pull'` L658, L954→`executePull` | — | — | **живой, вне `ActionKind`** |
@@ -70,10 +73,10 @@
 | give | 3 | `case 'give'` L682, L1237 | — | — | **живой** |
 | limit_actions | 3 | `case 'limit_actions'` L1578 | — | — | **живой** |
 | reveal | 3 | `case 'reveal'` L1372 | — | — | **живой** |
-| modify_action | 3 | — | — | — | **НИКТО** |
+| modify_action | 3 | `updateStableEffect` L29 регистрирует; `executeAction`→`case 'sacrifice'` L1428 читает modify_action | — | **живой (только sacrifice quantity)** |
 | reorder_top | 2 | `case 'reorder_top'` L1493 | — | — | **живой** |
 | scry | 2 | — | — | — | **НИКТО** (`analyzeUnicornsRules.ts` — анализатор, не рантайм) |
-| restrict_action | 2 | — | — | — | **НИКТО** |
+| restrict_action | 2 | `isPlayPrevented` L422 — диспетчер для `action_type === 'play_spell' && card.type === 'magic'`; `updateStableEffect` L29 регистрирует | — | — | **живой** (только play_spell+magic ограничение) |
 | force_play | 2 | — | — | — | **НИКТО** |
 | extra_action | 1 | `case 'extra_action'` L1806 | — | — | **живой** |
 | swap | 1 | `case 'swap'` L683, L1310 | — | — | **живой** |
@@ -90,7 +93,7 @@
 | modify_win_condition | 1 | `case 'modify_win_condition'` L1615 | — | — | **живой** |
 | choose_players | 1 | — | — | — | **НИКТО** |
 | choose_card_type | 1 | — | — | — | **НИКТО** |
-| modify_hand_limit | 1 | — | — | — | **НИКТО** |
+| modify_hand_limit | 1 | `handLimit.ts` — отдельный путь; `updateStableEffect` L29 регистрирует | — | — | **живой через handLimitFor, не через executor** |
 
 ### Сводка по kind
 

@@ -51,8 +51,23 @@ export type PendingTriggerEffect = {
 } | null;
 export type Pending = PendingPlay | PendingPrompt | PendingTurnStartEffect | PendingTriggerEffect | null;
 
+// V7-4: реакция on_opponent_*, ожидающая открытия, пока владелец другого trigger_effect-окна
+// отвечает. Порядок очереди = порядок скана стабильов в dispatchTrigger (data-driven).
+export type QueuedReaction = {
+  trigger: string;
+  actorId: string;
+  sourceCardId: string;
+  effectIdx: number;
+  uncounterable?: boolean;
+  allow_intercept?: boolean;
+  optional?: boolean;
+};
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type ContinuationEnvelope = { version: 1; frames: JsonValue[] };
+
 // Полное состояние одной игры в памяти процесса
-export type GameEntry = { state: GameState; bus: EventBus; logs: LogEntry[]; pending: Pending; pendingTimeout?: any };
+export type GameEntry = { state: GameState; bus: EventBus; logs: LogEntry[]; pending: Pending; pendingTimeout?: any; pendingQueue?: QueuedReaction[]; continuation?: ContinuationEnvelope };
 
 // Единственное хранилище игр. Общий объект для REST-роутов и socket-слоя.
 export const games = new Map<string, GameEntry>();

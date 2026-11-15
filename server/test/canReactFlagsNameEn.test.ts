@@ -107,14 +107,15 @@ describe('canReactFlags: поиск флагов по name_en (каталог v2
     expect(probe.cannot_be_neighed).toBe(true);
   });
 
-  it('F9: таблица флагов содержит только три ключа правила Даниила', () => {
-    // Контроль на расширение таблицы «на глаз»: новые ключи должны приходить с правилом.
-    expect(Object.keys(CAN_REACT_FLAGS).sort()).toEqual([
-      'elusive oceloticorn',
-      'neigh means neigh',
-      'super neigh',
-      'super neigh (c&c)',
-      'yay',
-    ]);
+  it('F9: blocks_neigh_for_others берётся из флагов карты, а не из её имени', () => {
+    const dataDrivenCard: Card = {
+      id: 'x9',
+      name: 'Generic blocker',
+      static_properties: { blocks_neigh_for_others: true },
+    };
+    const out = applyCanReactFlags(dataDrivenCard);
+
+    expect(out.blocks_neigh_for_others).toBe(true);
+    expect(canReactFlagsForCardName('Generic blocker')).toEqual({});
   });
 });

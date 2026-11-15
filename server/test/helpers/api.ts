@@ -51,8 +51,9 @@ export async function play(
     .send(extra ? { cardId, ...extra } : { cardId });
 }
 
-export async function resolvePending(gameId: string): Promise<any> {
-  const res = await request(app).post(`/api/game/${gameId}/resolvePending`).send();
+export async function resolvePending(gameId: string, body: Record<string, unknown> = {}): Promise<any> {
+  // body: { cardId?, skip?, confirm?, byPlayerId? } — см. docs/API_CONTRACT.md §1.5
+  const res = await request(app).post(`/api/game/${gameId}/resolvePending`).send(body);
   return res;
 }
 
